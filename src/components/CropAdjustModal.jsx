@@ -1,15 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-
-const MIN_FRAC = 0.06
-
-function clampCrop(c) {
-  let { x, y, w, h } = c
-  w = Math.max(MIN_FRAC, Math.min(1, w))
-  h = Math.max(MIN_FRAC, Math.min(1, h))
-  x = Math.max(0, Math.min(1 - w, x))
-  y = Math.max(0, Math.min(1 - h, y))
-  return { x, y, w, h }
-}
+import { clampCropNorm, cropDataUrlFromNormalized } from '../lib/cropUtils.js'
 
 function getDisplayedImageRect(containerW, containerH, imgW, imgH) {
   if (!imgW || !imgH || !containerW || !containerH) {
@@ -21,33 +11,6 @@ function getDisplayedImageRect(containerW, containerH, imgW, imgH) {
   const x = (containerW - w) / 2
   const y = (containerH - h) / 2
   return { x, y, w, h }
-}
-
-async function loadImageElement(url) {
-  return new Promise((resolve, reject) => {
-    const img = new Image()
-    img.crossOrigin = 'anonymous'
-    img.onload = () => resolve(img)
-    img.onerror = () => reject(new Error('圖片載入失敗'))
-    img.src = url
-  })
-}
-
-export async function cropDataUrlFromNormalized(imageUrl, norm, jpegQuality = 0.92) {
-  const img = await loadImageElement(imageUrl)
-  const nw = img.naturalWidth
-  const nh = img.naturalHeight
-  const { x, y, w, h } = clampCrop(norm)
-  const sx = x * nw
-  const sy = y * nh
-  const sw = w * nw
-  const sh = h * nh
-  const canvas = document.createElement('canvas')
-  canvas.width = Math.max(1, Math.round(sw))
-  canvas.height = Math.max(1, Math.round(sh))
-  const ctx = canvas.getContext('2d')
-  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height)
-  return canvas.toDataURL('image/jpeg', jpegQuality)
 }
 
 function applyDrag(kind, startCrop, dnx, dny) {
@@ -85,23 +48,25 @@ function applyDrag(kind, startCrop, dnx, dny) {
     next.w = s.w + dnx
   }
 
-  return clampCrop(next)
+  return clampCropNorm(next)
 }
 
 /**
  * @param {object} props
- * @param {boolean} props.isOpen
  * @param {string|null} props.imageUrl
  * @param {() => void} props.onClose
- * @param {(dataUrl: string) => void} props.onApply
+ * @param {(dataUrl: string) => void | Promise<void>} props.onApply
  */
-export function CropAdjustModal({ isOpen, imageUrl, onClose, onApply }) {
+export function CropAdjustModal({ imageUrl, onClose, onApply }) {
   const stageRef = useRef(null)
   const imgRef = useRef(null)
   const dispRef = useRef({ x: 0, y: 0, w: 1, h: 1 })
+  const dialogRef = useRef(null)
   const [natural, setNatural] = useState({ w: 0, h: 0 })
   const [disp, setDisp] = useState({ x: 0, y: 0, w: 1, h: 1 })
   const [crop, setCrop] = useState({ x: 0, y: 0, w: 1, h: 1 })
+  const [applyError, setApplyError] = useState('')
+  const [isApplying, setIsApplying] = useState(false)
 
   useEffect(() => {
     dispRef.current = disp
@@ -118,13 +83,6 @@ export function CropAdjustModal({ isOpen, imageUrl, onClose, onApply }) {
   }, [natural.w, natural.h])
 
   useEffect(() => {
-    if (!isOpen || !imageUrl) return
-    setCrop({ x: 0, y: 0, w: 1, h: 1 })
-    setNatural({ w: 0, h: 0 })
-  }, [isOpen, imageUrl])
-
-  useEffect(() => {
-    if (!isOpen) return
     const ro = new ResizeObserver(() => measure())
     const el = stageRef.current
     if (el) ro.observe(el)
@@ -133,16 +91,23 @@ export function CropAdjustModal({ isOpen, imageUrl, onClose, onApply }) {
       ro.disconnect()
       window.removeEventListener('resize', measure)
     }
-  }, [isOpen, measure])
+  }, [measure])
 
   useEffect(() => {
-    if (!isOpen) return
     const onKey = (e) => {
       if (e.key === 'Escape') onClose()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [isOpen, onClose])
+  }, [onClose])
+
+  /** 開啟時焦點移入對話框，利於鍵盤與螢幕閱讀器 */
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      dialogRef.current?.querySelector('button')?.focus()
+    }, 0)
+    return () => clearTimeout(t)
+  }, [imageUrl])
 
   const handleImgLoad = (e) => {
     const el = e.target
@@ -184,16 +149,20 @@ export function CropAdjustModal({ isOpen, imageUrl, onClose, onApply }) {
 
   const handleApply = async () => {
     if (!imageUrl) return
+    setApplyError('')
+    setIsApplying(true)
     try {
       const out = await cropDataUrlFromNormalized(imageUrl, crop, 0.93)
       await Promise.resolve(onApply(out))
       onClose()
-    } catch {
-      onClose()
+    } catch (err) {
+      setApplyError(err?.message || '裁切套用失敗，請再試一次。')
+    } finally {
+      setIsApplying(false)
     }
   }
 
-  if (!isOpen || !imageUrl) return null
+  if (!imageUrl) return null
 
   const pxBox = {
     left: disp.x + crop.x * disp.w,
@@ -207,6 +176,7 @@ export function CropAdjustModal({ isOpen, imageUrl, onClose, onApply }) {
   return (
     <div className="crop-modal-backdrop" role="presentation" onClick={onClose}>
       <div
+        ref={dialogRef}
         className="crop-modal"
         role="dialog"
         aria-modal="true"
@@ -337,6 +307,8 @@ export function CropAdjustModal({ isOpen, imageUrl, onClose, onApply }) {
           )}
         </div>
 
+        {applyError ? <p className="crop-modal-error">{applyError}</p> : null}
+
         <div className="crop-modal-footer">
           <button type="button" className="button ghost" onClick={resetFull}>
             還原全圖
@@ -344,8 +316,13 @@ export function CropAdjustModal({ isOpen, imageUrl, onClose, onApply }) {
           <button type="button" className="button ghost" onClick={onClose}>
             關閉（不套用）
           </button>
-          <button type="button" className="button primary" onClick={handleApply}>
-            套用裁切
+          <button
+            type="button"
+            className="button primary"
+            onClick={handleApply}
+            disabled={isApplying}
+          >
+            {isApplying ? '套用中…' : '套用裁切'}
           </button>
         </div>
       </div>

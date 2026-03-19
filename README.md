@@ -14,7 +14,12 @@ npm run dev
 ```bash
 npm run build
 npm run preview
+npm run lint
 ```
+
+## 版本控制（團隊／自動部署）
+
+變更程式後請依序：`npm run lint` → `npm run build` → `git commit` → `git push`，以便 Netlify 等環境取得最新建置。
 
 ## 技術棧
 

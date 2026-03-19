@@ -285,6 +285,17 @@ label.button input {
   color: #64748b;
 }
 
+.crop-modal-error {
+  margin: 10px 16px 0;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: #b91c1c;
+  background: #fef2f2;
+  border-radius: 8px;
+  border: 1px solid #fecaca;
+}
+
 .crop-stage {
   position: relative;
   width: 100%;

@@ -2,11 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { jsPDF } from 'jspdf'
 import { CropAdjustModal } from '../components/CropAdjustModal.jsx'
 import { convertHeicToJpegDataUrl } from '../lib/heicConvert.js'
-import {
-  applyOpenCvDocumentScan,
-  applyOpenCvDocumentScanFromBitmap,
-  warmUpOpenCv,
-} from '../lib/documentScanOpenCv.js'
+import { applyOpenCvDocumentScanFromBitmap, warmUpOpenCv } from '../lib/documentScanOpenCv.js'
 import { createScaledScanBitmap } from '../lib/scanBitmapInput.js'
 import { autoCropByCornerBackground, enhanceDocumentScanAggressive } from '../lib/scanPreprocess.js'
 import '../App.css'
@@ -44,6 +40,9 @@ const SCAN_PIPELINE_CAP_LONG_EDGE = 4000
 const SCAN_PIPELINE_PREJPEG_QUALITY = 'medium'
 /** PDF 內嵌圖片長邊上限（從掃描原圖 baseSrc 取樣，宜與管線上限一致） */
 const PDF_EXPORT_MAX_LONG_EDGE = 4000
+
+const IMAGE_EDGE_MIN = 800
+const IMAGE_EDGE_MAX = 4000
 
 const COMMON_IMAGE_EXTENSIONS = new Set([
   'jpg',
@@ -89,11 +88,18 @@ function ToolPage() {
     return `目前共 ${images.length} 張`
   }, [images])
 
+  const stopCamera = useCallback(() => {
+    const stream = streamRef.current
+    if (!stream) return
+    stream.getTracks().forEach((track) => track.stop())
+    streamRef.current = null
+  }, [])
+
   useEffect(() => {
     return () => {
       stopCamera()
     }
-  }, [])
+  }, [stopCamera])
 
   useEffect(
     () => () => {
@@ -110,6 +116,13 @@ function ToolPage() {
     }
   }, [isCameraOpen])
 
+  /** 刪除圖片後若裁切對象已不存在，關閉 modal 避免幽靈狀態 */
+  useEffect(() => {
+    if (cropTargetId != null && !images.some((im) => im.id === cropTargetId)) {
+      setCropTargetId(null)
+    }
+  }, [cropTargetId, images])
+
   useEffect(() => {
     const kick = () => warmUpOpenCv()
     if (typeof requestIdleCallback === 'function') {
@@ -120,48 +133,63 @@ function ToolPage() {
     return () => clearTimeout(t)
   }, [])
 
-  const readBlobAsDataUrl = (blob, fileName = 'image') =>
-    new Promise((resolve, reject) => {
-      const reader = new FileReader()
-      reader.onload = () => resolve(reader.result)
-      reader.onerror = () => reject(new Error(`無法讀取檔案：${fileName}`))
-      reader.readAsDataURL(blob)
-    })
+  const readBlobAsDataUrl = useCallback(
+    (blob, fileName = 'image') =>
+      new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(reader.result)
+        reader.onerror = () => reject(new Error(`無法讀取檔案：${fileName}`))
+        reader.readAsDataURL(blob)
+      }),
+    [],
+  )
 
-  const readFileAsDataUrl = (file) => readBlobAsDataUrl(file, file.name)
+  const readFileAsDataUrl = useCallback(
+    (file) => readBlobAsDataUrl(file, file.name),
+    [readBlobAsDataUrl],
+  )
 
-  const loadImage = (dataUrl) =>
-    new Promise((resolve, reject) => {
-      const img = new Image()
-      img.onload = () => resolve(img)
-      img.onerror = () => reject(new Error('圖片解析失敗'))
-      img.src = dataUrl
-    })
+  const loadImage = useCallback(
+    (dataUrl) =>
+      new Promise((resolve, reject) => {
+        const img = new Image()
+        img.onload = () => resolve(img)
+        img.onerror = () => reject(new Error('圖片解析失敗'))
+        img.src = dataUrl
+      }),
+    [],
+  )
 
-  const compressImageWithDimensions = async (dataUrl, maxEdge, qualityPreset) => {
-    const image = await loadImage(dataUrl)
-    const longestEdge = Math.max(image.width, image.height)
-    const scale = longestEdge > maxEdge ? maxEdge / longestEdge : 1
+  const compressImageWithDimensions = useCallback(
+    async (dataUrl, maxEdge, qualityPreset) => {
+      const image = await loadImage(dataUrl)
+      const longestEdge = Math.max(image.width, image.height)
+      const scale = longestEdge > maxEdge ? maxEdge / longestEdge : 1
 
-    const canvas = document.createElement('canvas')
-    canvas.width = Math.max(1, Math.round(image.width * scale))
-    canvas.height = Math.max(1, Math.round(image.height * scale))
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.max(1, Math.round(image.width * scale))
+      canvas.height = Math.max(1, Math.round(image.height * scale))
 
-    const context = canvas.getContext('2d')
-    context.drawImage(image, 0, 0, canvas.width, canvas.height)
+      const context = canvas.getContext('2d')
+      context.drawImage(image, 0, 0, canvas.width, canvas.height)
 
-    const quality = JPEG_QUALITY_PRESETS[qualityPreset] || JPEG_QUALITY_PRESETS.medium
-    return {
-      dataUrl: canvas.toDataURL('image/jpeg', quality),
-      width: canvas.width,
-      height: canvas.height,
-    }
-  }
+      const quality = JPEG_QUALITY_PRESETS[qualityPreset] || JPEG_QUALITY_PRESETS.medium
+      return {
+        dataUrl: canvas.toDataURL('image/jpeg', quality),
+        width: canvas.width,
+        height: canvas.height,
+      }
+    },
+    [loadImage],
+  )
 
-  const compressImage = async (dataUrl, maxEdge, qualityPreset) => {
-    const { dataUrl: out } = await compressImageWithDimensions(dataUrl, maxEdge, qualityPreset)
-    return out
-  }
+  const compressImage = useCallback(
+    async (dataUrl, maxEdge, qualityPreset) => {
+      const { dataUrl: out } = await compressImageWithDimensions(dataUrl, maxEdge, qualityPreset)
+      return out
+    },
+    [compressImageWithDimensions],
+  )
 
   /**
    * @param {string} displaySrc 列表預覽用（可依「圖片壓縮品質」縮小）
@@ -169,7 +197,9 @@ function ToolPage() {
    * @param {string | null} [fullSrc] 掃描管線輸出；PDF／裁切用，避免預覽壓縮拖累列印品質
    */
   const toImageItem = (displaySrc, fileName = 'photo', fullSrc = null) => ({
-    id: crypto.randomUUID(),
+    id:
+      globalThis.crypto?.randomUUID?.() ??
+      `img-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
     src: displaySrc,
     baseSrc: fullSrc ?? displaySrc,
     name: `${fileName}.jpg`,
@@ -225,19 +255,20 @@ function ToolPage() {
     }
   }
 
-  const finalizeImageForList = async (pipelineDataUrl) => {
-    const q =
-      JPEG_QUALITY_PRESETS[imageCompressionQuality] || JPEG_QUALITY_PRESETS.medium
-    const maxEdge = scanPipelineInputLongEdge
-    if (imageCompressionQuality === 'high') {
-      const img = await loadImage(pipelineDataUrl)
-      const longest = Math.max(img.width, img.height)
-      if (longest <= maxEdge) {
-        return pipelineDataUrl
+  const finalizeImageForList = useCallback(
+    async (pipelineDataUrl) => {
+      const maxEdge = scanPipelineInputLongEdge
+      if (imageCompressionQuality === 'high') {
+        const img = await loadImage(pipelineDataUrl)
+        const longest = Math.max(img.width, img.height)
+        if (longest <= maxEdge) {
+          return pipelineDataUrl
+        }
       }
-    }
-    return compressImage(pipelineDataUrl, maxEdge, imageCompressionQuality)
-  }
+      return compressImage(pipelineDataUrl, maxEdge, imageCompressionQuality)
+    },
+    [compressImage, imageCompressionQuality, loadImage, scanPipelineInputLongEdge],
+  )
 
   const cropModalUrl = useMemo(() => {
     const im = images.find((item) => item.id === cropTargetId)
@@ -248,18 +279,24 @@ function ToolPage() {
     async (dataUrl) => {
       const id = cropTargetId
       if (!id) return
-      const compressed = await compressImage(
-        dataUrl,
-        scanPipelineInputLongEdge,
-        imageCompressionQuality,
-      )
-      setImages((prev) =>
-        prev.map((im) =>
-          im.id === id ? { ...im, baseSrc: dataUrl, src: compressed } : im,
-        ),
-      )
+      try {
+        const compressed = await compressImage(
+          dataUrl,
+          scanPipelineInputLongEdge,
+          imageCompressionQuality,
+        )
+        setImages((prev) =>
+          prev.map((im) =>
+            im.id === id ? { ...im, baseSrc: dataUrl, src: compressed } : im,
+          ),
+        )
+        setErrorMessage('')
+      } catch (err) {
+        setErrorMessage(err?.message || '套用裁切後壓縮失敗，請再試。')
+        throw err
+      }
     },
-    [cropTargetId, scanPipelineInputLongEdge, imageCompressionQuality],
+    [compressImage, cropTargetId, imageCompressionQuality, scanPipelineInputLongEdge],
   )
 
   const getSafeFileName = (value) => {
@@ -275,13 +312,6 @@ function ToolPage() {
     link.target = '_blank'
     link.rel = 'noopener noreferrer'
     link.click()
-  }
-
-  const stopCamera = () => {
-    const stream = streamRef.current
-    if (!stream) return
-    stream.getTracks().forEach((track) => track.stop())
-    streamRef.current = null
   }
 
   const handleUpload = async (event, mode = 'batch') => {
@@ -383,7 +413,10 @@ function ToolPage() {
     } finally {
       setIsProcessingImages(false)
       setUploadProgress(null)
-      event.target.value = ''
+      const input = event?.target
+      if (input && 'value' in input) {
+        input.value = ''
+      }
     }
   }
 
@@ -541,6 +574,7 @@ function ToolPage() {
           exportCompression,
           0,
         )
+        await yieldToUi()
       }
 
       const safeFileName = getSafeFileName(pdfFileName)
@@ -564,12 +598,14 @@ function ToolPage() {
 
   return (
     <main className="app">
-      <CropAdjustModal
-        isOpen={cropTargetId !== null}
-        imageUrl={cropModalUrl}
-        onClose={() => setCropTargetId(null)}
-        onApply={handleCropApplyFromModal}
-      />
+      {cropTargetId != null && cropModalUrl ? (
+        <CropAdjustModal
+          key={cropTargetId}
+          imageUrl={cropModalUrl}
+          onClose={() => setCropTargetId(null)}
+          onApply={handleCropApplyFromModal}
+        />
+      ) : null}
       <header className="header">
         <h1>照片轉 PDF</h1>
         <p>上傳或拍照後，調整順序與輸出設定，一鍵匯出 PDF。</p>
@@ -740,11 +776,15 @@ function ToolPage() {
             圖片長邊上限
             <input
               type="number"
-              min="800"
-              max="4000"
+              min={IMAGE_EDGE_MIN}
+              max={IMAGE_EDGE_MAX}
               step="100"
               value={maxImageEdge}
-              onChange={(event) => setMaxImageEdge(Number(event.target.value) || 2000)}
+              onChange={(event) => {
+                const n = Number(event.target.value)
+                if (!Number.isFinite(n)) return
+                setMaxImageEdge(Math.min(IMAGE_EDGE_MAX, Math.max(IMAGE_EDGE_MIN, n)))
+              }}
             />
           </label>
 
