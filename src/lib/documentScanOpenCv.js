@@ -250,6 +250,25 @@ function collectBestQuadFromContours(cv, contours, imgArea, scaleBack, dw, dh) {
   return best
 }
 
+/** 過大的 closing kernel 在 600～800px 圖上會讓主執行緒卡住數十秒 */
+function clampOddMorphKernel(dw, dh, ratio, minK = 11, maxK = 21) {
+  const base = Math.round(Math.min(dw, dh) * ratio)
+  let k = Math.max(minK, Math.min(maxK, base))
+  if (k % 2 === 0) k += 1
+  return k
+}
+
+function yieldToEventLoop() {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 0)
+  })
+}
+
+/** 進入工具頁後背景載入 OpenCV，避免第一次「單張上傳」像卡住 */
+export function warmUpOpenCv() {
+  void getCv()
+}
+
 function meanBorderLuma(blurred, dw, dh) {
   const border = Math.max(3, Math.floor(Math.min(dw, dh) * 0.07))
   let sum = 0
@@ -287,8 +306,7 @@ function detectQuadBrightPaperOnDesk(cv, gray, dw, dh, scaleBack) {
     const t = Math.min(252, Math.max(bgMean + 18, 140))
     cv.threshold(blurred, bin, t, 255, cv.THRESH_BINARY)
 
-    const kClose = Math.max(15, Math.round(Math.min(dw, dh) * 0.04))
-    const kOdd = kClose % 2 === 0 ? kClose + 1 : kClose
+    const kOdd = clampOddMorphKernel(dw, dh, 0.04, 15, 21)
     const kernelClose = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(kOdd, kOdd))
     cv.morphologyEx(bin, closed, cv.MORPH_CLOSE, kernelClose)
     kernelClose.delete()
@@ -328,8 +346,7 @@ function detectQuadOtsuPaper(cv, gray, dw, dh, scaleBack) {
       cv.bitwise_not(bin, bin)
     }
 
-    const kClose = Math.max(13, Math.round(Math.min(dw, dh) * 0.035))
-    const kOdd = kClose % 2 === 0 ? kClose + 1 : kClose
+    const kOdd = clampOddMorphKernel(dw, dh, 0.035, 13, 21)
     const kernelClose = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(kOdd, kOdd))
     cv.morphologyEx(bin, closed, cv.MORPH_CLOSE, kernelClose)
     kernelClose.delete()
@@ -396,14 +413,16 @@ function isStrongQuad(q, imgAreaFull) {
   return ratio >= 0.14 && ratio <= 0.91
 }
 
-function detectDocumentQuad(cv, gray, dw, dh, ds) {
+async function detectDocumentQuadAsync(cv, gray, dw, dh, ds) {
   const imgAreaFull = (dw * dh) / (ds * ds)
 
+  await yieldToEventLoop()
   const qBright = detectQuadBrightPaperOnDesk(cv, gray, dw, dh, ds)
   if (isStrongQuad(qBright, imgAreaFull)) {
     return qBright
   }
 
+  await yieldToEventLoop()
   const qOtsu = detectQuadOtsuPaper(cv, gray, dw, dh, ds)
   if (isStrongQuad(qOtsu, imgAreaFull)) {
     return pickBestQuad([qBright, qOtsu].filter(Boolean), imgAreaFull)
@@ -418,6 +437,7 @@ function detectDocumentQuad(cv, gray, dw, dh, ds) {
     [30, 90, 2],
     [40, 120, 2],
   ]) {
+    await yieldToEventLoop()
     const qc = detectQuadCanny(cv, blurred, dw, dh, ds, lo, hi, dil)
     if (qc) {
       candidates.push(qc)
@@ -428,10 +448,17 @@ function detectDocumentQuad(cv, gray, dw, dh, ds) {
     }
   }
 
+  const goodEnough = pickBestQuad(candidates, imgAreaFull)
+  if (goodEnough && quadScore(goodEnough, imgAreaFull) > 0) {
+    blurred.delete()
+    return goodEnough
+  }
+
   for (const [lo, hi, dil] of [
-    [20, 60, 3],
-    [15, 45, 3],
+    [20, 60, 2],
+    [15, 45, 2],
   ]) {
+    await yieldToEventLoop()
     const qc = detectQuadCanny(cv, blurred, dw, dh, ds, lo, hi, dil)
     if (qc) candidates.push(qc)
   }
@@ -450,23 +477,26 @@ const MAX_WARP_EDGE = 4500
 const MAX_WARP_PIXELS = 14_000_000
 
 export async function applyOpenCvDocumentScan(dataUrl, jpegQuality = 0.92) {
+  await yieldToEventLoop()
   const cv = await getCv()
   if (!cv) {
     return null
   }
 
+  await yieldToEventLoop()
   let canvas
   try {
-    canvas = await loadImageToCanvas(dataUrl, 2200)
+    canvas = await loadImageToCanvas(dataUrl, 2000)
   } catch {
     return null
   }
 
+  await yieldToEventLoop()
   const src = cv.imread(canvas)
   const w = src.cols
   const h = src.rows
 
-  const detectMax = 768
+  const detectMax = 600
   const ds = Math.min(1, detectMax / Math.max(w, h))
   const dw = Math.max(1, Math.round(w * ds))
   const dh = Math.max(1, Math.round(h * ds))
@@ -478,7 +508,8 @@ export async function applyOpenCvDocumentScan(dataUrl, jpegQuality = 0.92) {
     cv.resize(src, small, new cv.Size(dw, dh), 0, 0, cv.INTER_AREA)
     cv.cvtColor(small, gray, cv.COLOR_RGBA2GRAY, 0)
 
-    const ordered = detectDocumentQuad(cv, gray, dw, dh, ds)
+    await yieldToEventLoop()
+    const ordered = await detectDocumentQuadAsync(cv, gray, dw, dh, ds)
     if (!ordered) {
       return null
     }
@@ -494,6 +525,7 @@ export async function applyOpenCvDocumentScan(dataUrl, jpegQuality = 0.92) {
 
     const [tl, tr, br, bl] = ordered
 
+    await yieldToEventLoop()
     const srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y])
     const dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, maxW - 1, 0, maxW - 1, maxH - 1, 0, maxH - 1])
     const M = cv.getPerspectiveTransform(srcTri, dstTri)

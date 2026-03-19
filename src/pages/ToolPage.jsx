@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { jsPDF } from 'jspdf'
 import { convertHeicToJpegDataUrl } from '../lib/heicConvert.js'
-import { applyOpenCvDocumentScan } from '../lib/documentScanOpenCv.js'
+import { applyOpenCvDocumentScan, warmUpOpenCv } from '../lib/documentScanOpenCv.js'
 import { autoCropByCornerBackground, enhanceDocumentScan } from '../lib/scanPreprocess.js'
 import '../App.css'
 
@@ -90,6 +90,16 @@ function ToolPage() {
       videoRef.current.srcObject = streamRef.current
     }
   }, [isCameraOpen])
+
+  useEffect(() => {
+    const kick = () => warmUpOpenCv()
+    if (typeof requestIdleCallback === 'function') {
+      const id = requestIdleCallback(kick, { timeout: 4000 })
+      return () => cancelIdleCallback(id)
+    }
+    const t = window.setTimeout(kick, 1200)
+    return () => clearTimeout(t)
+  }, [])
 
   const readBlobAsDataUrl = (blob, fileName = 'image') =>
     new Promise((resolve, reject) => {
