@@ -48,6 +48,7 @@ function App() {
   const [cameraMode, setCameraMode] = useState('single')
   const [isExporting, setIsExporting] = useState(false)
   const [isProcessingImages, setIsProcessingImages] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(null)
   const [errorMessage, setErrorMessage] = useState('')
   const [pdfPageSize, setPdfPageSize] = useState('a4')
   const [pdfMarginPreset, setPdfMarginPreset] = useState('normal')
@@ -183,8 +184,26 @@ function App() {
     setIsProcessingImages(true)
     try {
       const targetFiles = mode === 'single' ? files.slice(0, 1) : files
-      const results = await Promise.allSettled(
-        targetFiles.map(async (file, index) => {
+      const successItems = []
+      const failItems = []
+
+      setUploadProgress({
+        mode,
+        total: targetFiles.length,
+        current: 0,
+        currentFileName: '',
+      })
+
+      for (let index = 0; index < targetFiles.length; index += 1) {
+        const file = targetFiles[index]
+        setUploadProgress({
+          mode,
+          total: targetFiles.length,
+          current: index + 1,
+          currentFileName: file.name,
+        })
+
+        try {
           const normalizedDataUrl = await normalizeUploadFileToDataUrl(file)
           const compressedDataUrl = await compressImage(
             normalizedDataUrl,
@@ -192,14 +211,11 @@ function App() {
             imageCompressionQuality,
           )
           const name = getFileBaseName(file.name) || `upload-${index + 1}`
-          return toImageItem(compressedDataUrl, name)
-        }),
-      )
-
-      const successItems = results
-        .filter((result) => result.status === 'fulfilled')
-        .map((result) => result.value)
-      const failItems = results.filter((result) => result.status === 'rejected')
+          successItems.push(toImageItem(compressedDataUrl, name))
+        } catch (error) {
+          failItems.push(error)
+        }
+      }
 
       if (successItems.length > 0) {
         setImages((prev) => [...prev, ...successItems])
@@ -208,7 +224,7 @@ function App() {
       if (failItems.length > 0) {
         const names = failItems
           .slice(0, 3)
-          .map((result) => result.reason?.message?.replace('不支援的檔案格式：', '') || '未知檔案')
+          .map((error) => error?.message?.replace('不支援的檔案格式：', '') || '未知檔案')
           .join('、')
         const suffix = failItems.length > 3 ? '...' : ''
         setErrorMessage(`有 ${failItems.length} 個檔案匯入失敗：${names}${suffix}`)
@@ -217,6 +233,7 @@ function App() {
       setErrorMessage(error.message || '上傳失敗，請再試一次。')
     } finally {
       setIsProcessingImages(false)
+      setUploadProgress(null)
       event.target.value = ''
     }
   }
@@ -417,9 +434,35 @@ function App() {
               >
                 {isProcessingImages ? '處理中...' : cameraMode === 'single' ? '拍照（單拍）' : '拍照（批拍）'}
               </button>
-              <button type="button" className="button ghost" onClick={closeCamera}>
-                關閉相機
-              </button>
+              {cameraMode === 'batch' ? (
+                <>
+                  <button
+                    type="button"
+                    className="button primary"
+                    onClick={closeCamera}
+                    disabled={isProcessingImages}
+                  >
+                    完成批拍
+                  </button>
+                  <button
+                    type="button"
+                    className="button ghost"
+                    onClick={closeCamera}
+                    disabled={isProcessingImages}
+                  >
+                    取消批拍
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="button ghost"
+                  onClick={closeCamera}
+                  disabled={isProcessingImages}
+                >
+                  關閉相機
+                </button>
+              )}
             </>
           )}
         </div>
@@ -428,6 +471,19 @@ function App() {
           <div className="camera-box">
             <div className="camera-mode">{cameraMode === 'single' ? '目前模式：單拍' : '目前模式：批拍'}</div>
             <video ref={videoRef} autoPlay playsInline muted />
+          </div>
+        )}
+
+        {isProcessingImages && uploadProgress && uploadProgress.total > 0 && (
+          <div className="progress-card">
+            <div className="progress-text">
+              <strong>
+                {uploadProgress.mode === 'batch' ? '批次匯入中' : '單張匯入中'} {uploadProgress.current}/
+                {uploadProgress.total}
+              </strong>
+              <span>{uploadProgress.currentFileName}</span>
+            </div>
+            <progress value={uploadProgress.current} max={uploadProgress.total} />
           </div>
         )}
 
