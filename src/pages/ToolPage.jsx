@@ -60,9 +60,6 @@ function ToolPage() {
   const [pdfFileName, setPdfFileName] = useState('scanned-document')
   const [maxImageEdge, setMaxImageEdge] = useState(2000)
   const [imageCompressionQuality, setImageCompressionQuality] = useState('medium')
-  const [scanDocumentEnhance, setScanDocumentEnhance] = useState(true)
-  const [scanAutoCrop, setScanAutoCrop] = useState(false)
-  const [scanOpenCvMode, setScanOpenCvMode] = useState(true)
   const videoRef = useRef(null)
   const streamRef = useRef(null)
   const uploadSingleInputRef = useRef(null)
@@ -157,22 +154,22 @@ function ToolPage() {
     return COMMON_IMAGE_EXTENSIONS.has(getFileExtension(file.name))
   }
 
+  const yieldToUi = () =>
+    new Promise((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(resolve))
+    })
+
   const applyScanPipeline = async (dataUrl) => {
     const q = JPEG_QUALITY_PRESETS[imageCompressionQuality] || JPEG_QUALITY_PRESETS.medium
     let url = dataUrl
     try {
-      if (scanOpenCvMode) {
-        const openCvUrl = await applyOpenCvDocumentScan(dataUrl, q)
-        if (openCvUrl) {
-          return openCvUrl
-        }
+      await yieldToUi()
+      const openCvUrl = await applyOpenCvDocumentScan(dataUrl, q)
+      if (openCvUrl) {
+        return openCvUrl
       }
-      if (scanAutoCrop) {
-        url = await autoCropByCornerBackground(url, q)
-      }
-      if (scanDocumentEnhance) {
-        url = await enhanceDocumentScan(url, q)
-      }
+      url = await autoCropByCornerBackground(url, q)
+      url = await enhanceDocumentScan(url, q)
     } catch {
       return dataUrl
     }
@@ -227,7 +224,6 @@ function ToolPage() {
         total: targetFiles.length,
         current: 0,
         currentFileName: '',
-        isHeic: false,
       })
 
       for (let index = 0; index < targetFiles.length; index += 1) {
@@ -237,7 +233,6 @@ function ToolPage() {
           total: targetFiles.length,
           current: index + 1,
           currentFileName: file.name,
-          isHeic: isHeicFile(file),
         })
 
         try {
@@ -534,11 +529,6 @@ function ToolPage() {
               <span>{uploadProgress.currentFileName}</span>
             </div>
             <progress value={uploadProgress.current} max={uploadProgress.total} />
-            {uploadProgress.isHeic && (
-              <p className="progress-heic-hint">
-                HEIC 在背景執行解碼（不會凍結畫面），依照片大小約需數秒至數十秒；可將下方「圖片長邊上限」調低以加快處理。
-              </p>
-            )}
           </div>
         )}
 
@@ -607,42 +597,6 @@ function ToolPage() {
               <option value="low">低</option>
             </select>
           </label>
-        </div>
-
-        <div className="scan-options">
-          <p className="scan-options-title">掃描品質（匯入／拍照當下套用）</p>
-          <label className="check-row">
-            <input
-              type="checkbox"
-              checked={scanOpenCvMode}
-              onChange={(event) => setScanOpenCvMode(event.target.checked)}
-            />
-            <span>
-              掃描器模式（自動偵測紙張邊緣、透視校正、淨白背景；成功時不再套用下方兩項）
-            </span>
-          </label>
-          <label className="check-row">
-            <input
-              type="checkbox"
-              checked={scanDocumentEnhance}
-              onChange={(event) => setScanDocumentEnhance(event.target.checked)}
-            />
-            <span>文件加強（OpenCV 失敗時：提高對比與可讀性）</span>
-          </label>
-          <label className="check-row">
-            <input
-              type="checkbox"
-              checked={scanAutoCrop}
-              onChange={(event) => setScanAutoCrop(event.target.checked)}
-            />
-            <span>
-              簡易自動裁切（OpenCV 失敗時：從邊緣桌面推斷紙張；白紙＋單色桌面較準）
-            </span>
-          </label>
-          <p className="scan-hint">
-            掃描器模式首次載入會下載較大的影像函式庫，請稍候。HEIC
-            在背景解碼；若失敗請到 iPhone「設定 → 相機 → 格式」改為「最佳相容性」。
-          </p>
         </div>
 
         <div className="toolbar">

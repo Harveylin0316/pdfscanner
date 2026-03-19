@@ -4,31 +4,63 @@
  * 失敗時回傳 null。
  */
 
-let cvReady = null
+/** 初始化失敗時會清掉，下次可重試 */
+let opencvLoadPromise = null
+
+const OPENCV_INIT_TIMEOUT_MS = 90_000
 
 async function getCv() {
-  if (!cvReady) {
-    cvReady = (async () => {
-      const cvModule = await import('@techstark/opencv-js')
-      const m = cvModule.default ?? cvModule
-      if (m instanceof Promise) {
-        return await m
-      }
-      await new Promise((resolve) => {
-        if (m.calledRun) {
-          resolve()
-          return
-        }
-        const prev = m.onRuntimeInitialized
-        m.onRuntimeInitialized = () => {
-          if (typeof prev === 'function') prev()
-          resolve()
-        }
-      })
-      return m
-    })()
+  if (!opencvLoadPromise) {
+    opencvLoadPromise = loadOpenCvOnce()
   }
-  return cvReady
+  try {
+    return await opencvLoadPromise
+  } catch {
+    opencvLoadPromise = null
+    return null
+  }
+}
+
+async function loadOpenCvOnce() {
+  const cvModule = await import('@techstark/opencv-js')
+  let m = cvModule.default ?? cvModule
+  if (m instanceof Promise) {
+    m = await m
+  }
+
+  const waitRuntime = new Promise((resolve) => {
+    const finish = () => resolve()
+
+    if (m.runtimeInitialized === true || m.calledRun === true) {
+      finish()
+      return
+    }
+
+    const prev = m.onRuntimeInitialized
+    m.onRuntimeInitialized = () => {
+      try {
+        if (typeof prev === 'function') prev()
+      } catch {
+        /* ignore user hook errors */
+      }
+      finish()
+    }
+
+    queueMicrotask(() => {
+      if (m.runtimeInitialized === true || m.calledRun === true) {
+        finish()
+      }
+    })
+  })
+
+  await Promise.race([
+    waitRuntime,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('OpenCV init timeout')), OPENCV_INIT_TIMEOUT_MS)
+    }),
+  ])
+
+  return m
 }
 
 function loadImageToCanvas(dataUrl, maxLongEdge = 2400) {
@@ -222,13 +254,17 @@ function meanBorderLuma(blurred, dw, dh) {
   const border = Math.max(3, Math.floor(Math.min(dw, dh) * 0.07))
   let sum = 0
   let n = 0
-  for (let y = 0; y < dh; y += 1) {
-    for (let x = 0; x < dw; x += 1) {
-      if (y < border || y >= dh - border || x < border || x >= dw - border) {
-        sum += blurred.ucharAt(y, x)
-        n += 1
-      }
-    }
+  const add = (y, x) => {
+    sum += blurred.ucharAt(y, x)
+    n += 1
+  }
+  for (let x = 0; x < dw; x += 1) {
+    for (let y = 0; y < border; y += 1) add(y, x)
+    for (let y = dh - border; y < dh; y += 1) add(y, x)
+  }
+  for (let y = border; y < dh - border; y += 1) {
+    for (let x = 0; x < border; x += 1) add(y, x)
+    for (let x = dw - border; x < dw; x += 1) add(y, x)
   }
   return n > 0 ? sum / n : 128
 }
@@ -352,22 +388,47 @@ function pickBestQuad(candidates, imgAreaFull) {
   return best
 }
 
+/** 面積比合理時提早結束，避免連跑 6 組輪廓偵測把主執行緒卡很久 */
+function isStrongQuad(q, imgAreaFull) {
+  if (!q) return false
+  const a = quadArea(q)
+  const ratio = a / imgAreaFull
+  return ratio >= 0.14 && ratio <= 0.91
+}
+
 function detectDocumentQuad(cv, gray, dw, dh, ds) {
+  const imgAreaFull = (dw * dh) / (ds * ds)
+
+  const qBright = detectQuadBrightPaperOnDesk(cv, gray, dw, dh, ds)
+  if (isStrongQuad(qBright, imgAreaFull)) {
+    return qBright
+  }
+
+  const qOtsu = detectQuadOtsuPaper(cv, gray, dw, dh, ds)
+  if (isStrongQuad(qOtsu, imgAreaFull)) {
+    return pickBestQuad([qBright, qOtsu].filter(Boolean), imgAreaFull)
+  }
+
   const blurred = new cv.Mat()
   cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT)
 
-  const imgAreaFull = (dw * dh) / (ds * ds)
-  const candidates = []
-
-  const qBright = detectQuadBrightPaperOnDesk(cv, gray, dw, dh, ds)
-  if (qBright) candidates.push(qBright)
-
-  const qOtsu = detectQuadOtsuPaper(cv, gray, dw, dh, ds)
-  if (qOtsu) candidates.push(qOtsu)
+  const candidates = [qBright, qOtsu].filter(Boolean)
 
   for (const [lo, hi, dil] of [
     [30, 90, 2],
     [40, 120, 2],
+  ]) {
+    const qc = detectQuadCanny(cv, blurred, dw, dh, ds, lo, hi, dil)
+    if (qc) {
+      candidates.push(qc)
+      if (isStrongQuad(qc, imgAreaFull)) {
+        blurred.delete()
+        return qc
+      }
+    }
+  }
+
+  for (const [lo, hi, dil] of [
     [20, 60, 3],
     [15, 45, 3],
   ]) {
@@ -376,7 +437,6 @@ function detectDocumentQuad(cv, gray, dw, dh, ds) {
   }
 
   blurred.delete()
-
   return pickBestQuad(candidates, imgAreaFull)
 }
 
@@ -385,17 +445,19 @@ function detectDocumentQuad(cv, gray, dw, dh, ds) {
  * @param {number} jpegQuality
  * @returns {Promise<string|null>}
  */
+/** 錯誤四邊形會拉出超大輸出，warp / toDataURL 會像當機 */
+const MAX_WARP_EDGE = 4500
+const MAX_WARP_PIXELS = 14_000_000
+
 export async function applyOpenCvDocumentScan(dataUrl, jpegQuality = 0.92) {
-  let cv
-  try {
-    cv = await getCv()
-  } catch {
+  const cv = await getCv()
+  if (!cv) {
     return null
   }
 
   let canvas
   try {
-    canvas = await loadImageToCanvas(dataUrl, 2600)
+    canvas = await loadImageToCanvas(dataUrl, 2200)
   } catch {
     return null
   }
@@ -404,7 +466,7 @@ export async function applyOpenCvDocumentScan(dataUrl, jpegQuality = 0.92) {
   const w = src.cols
   const h = src.rows
 
-  const detectMax = 900
+  const detectMax = 768
   const ds = Math.min(1, detectMax / Math.max(w, h))
   const dw = Math.max(1, Math.round(w * ds))
   const dh = Math.max(1, Math.round(h * ds))
@@ -421,7 +483,15 @@ export async function applyOpenCvDocumentScan(dataUrl, jpegQuality = 0.92) {
       return null
     }
 
-    const [maxW, maxH] = quadWidthHeight(ordered)
+    let [maxW, maxH] = quadWidthHeight(ordered)
+    if (
+      maxW > MAX_WARP_EDGE ||
+      maxH > MAX_WARP_EDGE ||
+      maxW * maxH > MAX_WARP_PIXELS
+    ) {
+      return null
+    }
+
     const [tl, tr, br, bl] = ordered
 
     const srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y])
