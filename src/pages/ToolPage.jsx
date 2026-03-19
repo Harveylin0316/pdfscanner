@@ -351,7 +351,7 @@ function ToolPage() {
       if (videoRef.current) {
         videoRef.current.srcObject = stream
       }
-    } catch (error) {
+    } catch {
       setErrorMessage('無法開啟相機，請確認權限或 HTTPS 環境。')
     }
   }

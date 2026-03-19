@@ -1,16 +1,27 @@
-# React + Vite
+# 照片轉 PDF（pdfscanner3）
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+瀏覽器內將圖片合併為 PDF：上傳／相機、HEIC 轉換、壓縮與輸出設定。圖片於**使用者裝置本機**處理。
 
-Currently, two official plugins are available:
+## 開發
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+```bash
+npm install
+npm run dev
+```
 
-## React Compiler
+## 建置
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+```bash
+npm run build
+npm run preview
+```
 
-## Expanding the ESLint configuration
+## 技術棧
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+- React 19 + Vite 8
+- jsPDF、heic-to / heic2any（HEIC）
+- Netlify：`netlify.toml`（含 `/tool` → `/` 301 與 SPA fallback）
+
+## 文件
+
+- [掃描品質與 HEIC 說明](./docs/SCAN_AND_HEIC.md)
