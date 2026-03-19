@@ -2,11 +2,41 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { jsPDF } from 'jspdf'
 import './App.css'
 
+const PDF_SIZE_OPTIONS = [
+  { value: 'a4', label: 'A4' },
+  { value: 'letter', label: 'Letter' },
+]
+
+const MARGIN_PRESETS = {
+  none: 0,
+  normal: 10,
+  wide: 20,
+}
+
+const JPEG_QUALITY_PRESETS = {
+  high: 0.92,
+  medium: 0.8,
+  low: 0.65,
+}
+
+const PDF_IMAGE_COMPRESSION = {
+  high: 'FAST',
+  medium: 'MEDIUM',
+  low: 'SLOW',
+}
+
 function App() {
   const [images, setImages] = useState([])
   const [isCameraOpen, setIsCameraOpen] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
+  const [isProcessingImages, setIsProcessingImages] = useState(false)
   const [errorMessage, setErrorMessage] = useState('')
+  const [pdfPageSize, setPdfPageSize] = useState('a4')
+  const [pdfMarginPreset, setPdfMarginPreset] = useState('normal')
+  const [pdfOutputQuality, setPdfOutputQuality] = useState('medium')
+  const [pdfFileName, setPdfFileName] = useState('scanned-document')
+  const [maxImageEdge, setMaxImageEdge] = useState(2000)
+  const [imageCompressionQuality, setImageCompressionQuality] = useState('medium')
   const videoRef = useRef(null)
   const streamRef = useRef(null)
 
@@ -27,15 +57,6 @@ function App() {
     }
   }, [isCameraOpen])
 
-  const toImageItem = (source, fileName = 'photo') => {
-    const extension = source.startsWith('data:image/png') ? 'png' : 'jpg'
-    return {
-      id: crypto.randomUUID(),
-      src: source,
-      name: `${fileName}.${extension}`,
-    }
-  }
-
   const readFileAsDataUrl = (file) =>
     new Promise((resolve, reject) => {
       const reader = new FileReader()
@@ -44,13 +65,41 @@ function App() {
       reader.readAsDataURL(file)
     })
 
-  const getImageSize = (dataUrl) =>
+  const loadImage = (dataUrl) =>
     new Promise((resolve, reject) => {
       const img = new Image()
-      img.onload = () => resolve({ width: img.width, height: img.height })
+      img.onload = () => resolve(img)
       img.onerror = () => reject(new Error('圖片解析失敗'))
       img.src = dataUrl
     })
+
+  const compressImage = async (dataUrl, maxEdge, qualityPreset) => {
+    const image = await loadImage(dataUrl)
+    const longestEdge = Math.max(image.width, image.height)
+    const scale = longestEdge > maxEdge ? maxEdge / longestEdge : 1
+
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.max(1, Math.round(image.width * scale))
+    canvas.height = Math.max(1, Math.round(image.height * scale))
+
+    const context = canvas.getContext('2d')
+    context.drawImage(image, 0, 0, canvas.width, canvas.height)
+
+    const quality = JPEG_QUALITY_PRESETS[qualityPreset] || JPEG_QUALITY_PRESETS.medium
+    return canvas.toDataURL('image/jpeg', quality)
+  }
+
+  const toImageItem = (source, fileName = 'photo') => ({
+    id: crypto.randomUUID(),
+    src: source,
+    name: `${fileName}.jpg`,
+  })
+
+  const getSafeFileName = (value) => {
+    const normalized = value.trim().replace(/[\\/:*?"<>|]+/g, '-')
+    if (!normalized) return 'scanned-document.pdf'
+    return normalized.toLowerCase().endsWith('.pdf') ? normalized : `${normalized}.pdf`
+  }
 
   const stopCamera = () => {
     const stream = streamRef.current
@@ -64,9 +113,13 @@ function App() {
     if (files.length === 0) return
 
     setErrorMessage('')
+    setIsProcessingImages(true)
     try {
       const dataUrls = await Promise.all(files.map((file) => readFileAsDataUrl(file)))
-      const newImages = dataUrls.map((url, index) => {
+      const compressedUrls = await Promise.all(
+        dataUrls.map((url) => compressImage(url, maxImageEdge, imageCompressionQuality)),
+      )
+      const newImages = compressedUrls.map((url, index) => {
         const name = files[index]?.name?.replace(/\.[^.]+$/, '') || `upload-${index + 1}`
         return toImageItem(url, name)
       })
@@ -74,6 +127,7 @@ function App() {
     } catch (error) {
       setErrorMessage(error.message || '上傳失敗，請再試一次。')
     } finally {
+      setIsProcessingImages(false)
       event.target.value = ''
     }
   }
@@ -103,7 +157,7 @@ function App() {
     stopCamera()
   }
 
-  const capturePhoto = () => {
+  const capturePhoto = async () => {
     const video = videoRef.current
     if (!video || !video.videoWidth || !video.videoHeight) return
 
@@ -112,8 +166,18 @@ function App() {
     canvas.height = video.videoHeight
     const context = canvas.getContext('2d')
     context.drawImage(video, 0, 0)
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.92)
-    setImages((prev) => [...prev, toImageItem(dataUrl, `capture-${prev.length + 1}`)])
+    setIsProcessingImages(true)
+    setErrorMessage('')
+
+    try {
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.95)
+      const compressed = await compressImage(dataUrl, maxImageEdge, imageCompressionQuality)
+      setImages((prev) => [...prev, toImageItem(compressed, `capture-${prev.length + 1}`)])
+    } catch (error) {
+      setErrorMessage(error.message || '拍照處理失敗，請再試一次。')
+    } finally {
+      setIsProcessingImages(false)
+    }
   }
 
   const removeImage = (id) => {
@@ -139,29 +203,46 @@ function App() {
       const pdf = new jsPDF({
         orientation: 'portrait',
         unit: 'mm',
-        format: 'a4',
+        format: pdfPageSize,
       })
+
+      const margin = MARGIN_PRESETS[pdfMarginPreset] ?? MARGIN_PRESETS.normal
+      const exportCompression = PDF_IMAGE_COMPRESSION[pdfOutputQuality] || 'MEDIUM'
 
       for (let index = 0; index < images.length; index += 1) {
         const image = images[index]
-        const { width, height } = await getImageSize(image.src)
+        const exportSrc = await compressImage(image.src, 2800, pdfOutputQuality)
+        const imageEl = await loadImage(exportSrc)
+        const width = imageEl.width
+        const height = imageEl.height
         const pageWidth = pdf.internal.pageSize.getWidth()
         const pageHeight = pdf.internal.pageSize.getHeight()
+        const contentWidth = Math.max(1, pageWidth - margin * 2)
+        const contentHeight = Math.max(1, pageHeight - margin * 2)
 
-        const scale = Math.min(pageWidth / width, pageHeight / height)
+        const scale = Math.min(contentWidth / width, contentHeight / height)
         const renderWidth = width * scale
         const renderHeight = height * scale
-        const x = (pageWidth - renderWidth) / 2
-        const y = (pageHeight - renderHeight) / 2
+        const x = margin + (contentWidth - renderWidth) / 2
+        const y = margin + (contentHeight - renderHeight) / 2
 
         if (index > 0) {
           pdf.addPage()
         }
-        const imageType = image.src.startsWith('data:image/png') ? 'PNG' : 'JPEG'
-        pdf.addImage(image.src, imageType, x, y, renderWidth, renderHeight, undefined, 'FAST')
+        pdf.addImage(
+          exportSrc,
+          'JPEG',
+          x,
+          y,
+          renderWidth,
+          renderHeight,
+          undefined,
+          exportCompression,
+          0,
+        )
       }
 
-      pdf.save('scanned-document.pdf')
+      pdf.save(getSafeFileName(pdfFileName))
     } catch (error) {
       setErrorMessage(error.message || 'PDF 產生失敗，請稍後再試。')
     } finally {
@@ -180,17 +261,33 @@ function App() {
         <div className="button-group">
           <label className="button secondary">
             上傳圖片
-            <input type="file" accept="image/*" multiple onChange={handleUpload} />
+            <input
+              type="file"
+              accept="image/*"
+              multiple
+              onChange={handleUpload}
+              disabled={isProcessingImages}
+            />
           </label>
 
           {!isCameraOpen ? (
-            <button type="button" className="button secondary" onClick={startCamera}>
+            <button
+              type="button"
+              className="button secondary"
+              onClick={startCamera}
+              disabled={isProcessingImages}
+            >
               開啟相機
             </button>
           ) : (
             <>
-              <button type="button" className="button secondary" onClick={capturePhoto}>
-                拍照
+              <button
+                type="button"
+                className="button secondary"
+                onClick={capturePhoto}
+                disabled={isProcessingImages}
+              >
+                {isProcessingImages ? '處理中...' : '拍照'}
               </button>
               <button type="button" className="button ghost" onClick={closeCamera}>
                 關閉相機
@@ -205,13 +302,80 @@ function App() {
           </div>
         )}
 
+        <div className="settings-grid">
+          <label>
+            頁面大小
+            <select value={pdfPageSize} onChange={(event) => setPdfPageSize(event.target.value)}>
+              {PDF_SIZE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label>
+            邊距
+            <select value={pdfMarginPreset} onChange={(event) => setPdfMarginPreset(event.target.value)}>
+              <option value="none">無邊距</option>
+              <option value="normal">一般</option>
+              <option value="wide">寬邊距</option>
+            </select>
+          </label>
+
+          <label>
+            PDF 品質
+            <select value={pdfOutputQuality} onChange={(event) => setPdfOutputQuality(event.target.value)}>
+              <option value="high">高</option>
+              <option value="medium">中</option>
+              <option value="low">低</option>
+            </select>
+          </label>
+
+          <label>
+            檔名
+            <input
+              type="text"
+              value={pdfFileName}
+              onChange={(event) => setPdfFileName(event.target.value)}
+              placeholder="scanned-document"
+            />
+          </label>
+        </div>
+
+        <div className="settings-grid compression">
+          <label>
+            圖片長邊上限
+            <input
+              type="number"
+              min="800"
+              max="4000"
+              step="100"
+              value={maxImageEdge}
+              onChange={(event) => setMaxImageEdge(Number(event.target.value) || 2000)}
+            />
+          </label>
+
+          <label>
+            圖片壓縮品質
+            <select
+              value={imageCompressionQuality}
+              onChange={(event) => setImageCompressionQuality(event.target.value)}
+            >
+              <option value="high">高</option>
+              <option value="medium">中</option>
+              <option value="low">低</option>
+            </select>
+          </label>
+        </div>
+
         <div className="toolbar">
           <span>{imageCountLabel}</span>
           <button
             type="button"
             className="button primary"
             onClick={exportPdf}
-            disabled={images.length === 0 || isExporting}
+            disabled={images.length === 0 || isExporting || isProcessingImages}
           >
             {isExporting ? '輸出中...' : '輸出 PDF'}
           </button>

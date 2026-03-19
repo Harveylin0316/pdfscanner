@@ -88,6 +88,36 @@ label.button input {
   gap: 10px;
 }
 
+.settings-grid {
+  margin-top: 14px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.settings-grid label {
+  display: grid;
+  gap: 6px;
+  text-align: left;
+  font-size: 13px;
+  color: #334155;
+}
+
+.settings-grid select,
+.settings-grid input {
+  width: 100%;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  color: #0f172a;
+  padding: 8px 10px;
+  font-size: 14px;
+}
+
+.settings-grid.compression {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .error {
   margin: 10px 0 0;
   color: #b91c1c;
@@ -138,5 +168,10 @@ label.button input {
   .toolbar {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .settings-grid,
+  .settings-grid.compression {
+    grid-template-columns: 1fr;
   }
 }
