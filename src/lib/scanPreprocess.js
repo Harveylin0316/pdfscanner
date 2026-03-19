@@ -45,8 +45,8 @@ export async function enhanceDocumentScan(dataUrl, quality = 0.92) {
 /**
  * OpenCV 失敗時：較強的「掃描感」濾鏡（淨白紙張、字更黑）。
  */
-export async function enhanceDocumentScanAggressive(dataUrl, quality = 0.92) {
-  const { canvas, width, height } = await loadImageToCanvas(dataUrl)
+export async function enhanceDocumentScanAggressive(dataUrl, quality = 0.92, maxEdge = 2200) {
+  const { canvas, width, height } = await loadImageToCanvas(dataUrl, maxEdge)
   const temp = document.createElement('canvas')
   temp.width = width
   temp.height = height
@@ -58,16 +58,16 @@ export async function enhanceDocumentScanAggressive(dataUrl, quality = 0.92) {
 }
 
 /**
- * 透視校正後：依亮度分位數拉開階調，紙張趨白、字趨黑（主執行緒、輕量）。
+ * 透視校正後色階（主執行緒版）：不放大回原始畫素，避免大圖 toDataURL 卡死。
+ * OpenCV 成功路徑已改在 Worker 內處理；此函式保留供其他備援流程使用。
  */
-export async function polishScannedDocument(dataUrl, quality = 0.93) {
+export async function polishScannedDocument(dataUrl, quality = 0.93, maxWorkEdge = 1800) {
   const img = await loadImageNatural(dataUrl)
   const natW = img.naturalWidth
   const natH = img.naturalHeight
   if (!natW || !natH) return dataUrl
 
-  const maxEdge = 2600
-  const scale = Math.max(natW, natH) > maxEdge ? maxEdge / Math.max(natW, natH) : 1
+  const scale = Math.max(natW, natH) > maxWorkEdge ? maxWorkEdge / Math.max(natW, natH) : 1
   const w = Math.max(1, Math.round(natW * scale))
   const h = Math.max(1, Math.round(natH * scale))
 
@@ -102,15 +102,7 @@ export async function polishScannedDocument(dataUrl, quality = 0.93) {
   }
 
   ctx.putImageData(imageData, 0, 0)
-
-  const out = document.createElement('canvas')
-  out.width = natW
-  out.height = natH
-  const octx = out.getContext('2d')
-  octx.filter = 'contrast(1.05) brightness(1.02)'
-  octx.drawImage(canvas, 0, 0, w, h, 0, 0, natW, natH)
-  octx.filter = 'none'
-  return canvasToJpegDataUrl(out, quality)
+  return canvasToJpegDataUrl(canvas, quality)
 }
 
 function loadImageNatural(dataUrl) {

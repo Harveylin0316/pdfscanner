@@ -2,25 +2,53 @@
  * OpenCV 文件掃描核心（無 DOM canvas，供 Web Worker 與測試使用）
  */
 
-export async function decodeDataUrlToSrcMat(cv, dataUrl, maxLongEdge = 2000) {
+/**
+ * @param {{ width: number, height: number } | null | undefined} knownWH 若由主執行緒提供（與 JPEG 實際像素一致），可改走 createImageBitmap 的 resize 解碼，少一次全尺寸解碼。
+ */
+export async function decodeDataUrlToSrcMat(cv, dataUrl, maxLongEdge = 2000, knownWH = null) {
   const response = await fetch(dataUrl)
   const blob = await response.blob()
-  const bitmap = await createImageBitmap(blob)
-  const nw = bitmap.width
-  const nh = bitmap.height
+
+  let nw = knownWH?.width
+  let nh = knownWH?.height
+  if (!nw || !nh || nw < 1 || nh < 1) {
+    const probe = await createImageBitmap(blob)
+    nw = probe.width
+    nh = probe.height
+    probe.close()
+  }
   if (!nw || !nh) {
-    bitmap.close()
     throw new Error('圖片尺寸無效')
   }
+
   const scale = Math.min(1, maxLongEdge / Math.max(nw, nh))
   const w = Math.max(1, Math.round(nw * scale))
   const h = Math.max(1, Math.round(nh * scale))
-  const oc = new OffscreenCanvas(w, h)
-  const ctx = oc.getContext('2d')
-  ctx.drawImage(bitmap, 0, 0, w, h)
-  bitmap.close()
-  const imageData = ctx.getImageData(0, 0, w, h)
-  return cv.matFromImageData(imageData)
+
+  let bitmap
+  try {
+    if (scale < 1 && typeof createImageBitmap === 'function') {
+      bitmap = await createImageBitmap(blob, {
+        resizeWidth: w,
+        resizeHeight: h,
+        resizeQuality: 'high',
+      })
+    } else {
+      bitmap = await createImageBitmap(blob)
+    }
+  } catch {
+    bitmap = await createImageBitmap(blob)
+  }
+
+  try {
+    const oc = new OffscreenCanvas(w, h)
+    const ctx = oc.getContext('2d')
+    ctx.drawImage(bitmap, 0, 0, w, h)
+    const imageData = ctx.getImageData(0, 0, w, h)
+    return cv.matFromImageData(imageData)
+  } finally {
+    bitmap.close()
+  }
 }
 
 export async function matToJpegDataUrl(mat, quality) {
@@ -405,6 +433,50 @@ function detectDocumentQuad(cv, gray, dw, dh, ds) {
   return pickBestQuad(candidates, imgAreaFull)
 }
 
+/**
+ * 亮度分位數拉開（與主程式 polish 同概念），在 Worker 內改像素，避免主執行緒大圖 decode/upscale 卡死。
+ * 僅處理連續 CV_8UC4（scannerLookLab 輸出通常為連續）。
+ */
+function polishRgbaMatLuminance(mat) {
+  try {
+    if (typeof mat.isContinuous === 'function' && !mat.isContinuous()) return
+  } catch {
+    return
+  }
+
+  const rows = mat.rows
+  const cols = mat.cols
+  if (rows < 4 || cols < 4) return
+
+  const bytes = mat.data
+  const n = rows * cols
+  const sampleStep = Math.max(1, Math.ceil(n / 80000))
+  const samples = []
+  for (let j = 0; j < n; j += sampleStep) {
+    const i = j * 4
+    samples.push(bytes[i] * 0.299 + bytes[i + 1] * 0.587 + bytes[i + 2] * 0.114)
+  }
+  if (samples.length < 20) return
+  samples.sort((a, b) => a - b)
+  const lo = samples[Math.max(0, Math.floor(samples.length * 0.05))] ?? 0
+  const hi = samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.985))] ?? 255
+  const range = Math.max(22, hi - lo)
+  const mul = 255 / range
+
+  for (let j = 0; j < n; j += 1) {
+    const i = j * 4
+    const r = bytes[i]
+    const g = bytes[i + 1]
+    const b = bytes[i + 2]
+    const lum = r * 0.299 + g * 0.587 + b * 0.114
+    const lum2 = Math.min(255, Math.max(0, (lum - lo) * mul))
+    const k = lum > 2 ? lum2 / lum : 1
+    bytes[i] = Math.min(255, Math.round(r * k))
+    bytes[i + 1] = Math.min(255, Math.round(g * k))
+    bytes[i + 2] = Math.min(255, Math.round(b * k))
+  }
+}
+
 function scannerLookLab(cv, srcRgba) {
   const rgb = new cv.Mat()
   cv.cvtColor(srcRgba, rgb, cv.COLOR_RGBA2RGB, 0)
@@ -456,14 +528,20 @@ const MAX_WARP_EDGE = 4500
 const MAX_WARP_PIXELS = 14_000_000
 
 /** @returns {Promise<string|null>} */
-export async function runDocumentScanPipeline(cv, dataUrl, jpegQuality = 0.92) {
+export async function runDocumentScanPipeline(
+  cv,
+  dataUrl,
+  jpegQuality = 0.92,
+  maxDecodeLongEdge = 2000,
+  knownDecodeWH = null,
+) {
   let src = null
   const small = new cv.Mat()
   const gray = new cv.Mat()
 
   try {
     try {
-      src = await decodeDataUrlToSrcMat(cv, dataUrl, 2000)
+      src = await decodeDataUrlToSrcMat(cv, dataUrl, maxDecodeLongEdge, knownDecodeWH)
     } catch {
       return null
     }
@@ -511,6 +589,7 @@ export async function runDocumentScanPipeline(cv, dataUrl, jpegQuality = 0.92) {
     dstTri.delete()
     M.delete()
 
+    polishRgbaMatLuminance(enhanced)
     const url = await matToJpegDataUrl(enhanced, jpegQuality)
     enhanced.delete()
     return url

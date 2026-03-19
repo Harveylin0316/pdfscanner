@@ -71,7 +71,7 @@ async function drainInbox() {
   try {
     while (inbox.length > 0) {
       const event = inbox.shift()
-      const { id, type, dataUrl, jpegQuality } = event.data || {}
+      const { id, type, dataUrl, jpegQuality, maxDecodeLongEdge, knownDecodeWH } = event.data || {}
 
       if (type === 'warmup') {
         try {
@@ -89,7 +89,13 @@ async function drainInbox() {
           self.postMessage({ id, result: null })
           continue
         }
-        const result = await runDocumentScanPipeline(cv, dataUrl, jpegQuality ?? 0.92)
+        const result = await runDocumentScanPipeline(
+          cv,
+          dataUrl,
+          jpegQuality ?? 0.92,
+          maxDecodeLongEdge,
+          knownDecodeWH,
+        )
         self.postMessage({ id, result })
       } catch (err) {
         self.postMessage({ id, result: null, error: String(err?.message || err) })

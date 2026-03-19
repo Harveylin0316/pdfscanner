@@ -3,11 +3,7 @@ import { jsPDF } from 'jspdf'
 import { CropAdjustModal } from '../components/CropAdjustModal.jsx'
 import { convertHeicToJpegDataUrl } from '../lib/heicConvert.js'
 import { applyOpenCvDocumentScan, warmUpOpenCv } from '../lib/documentScanOpenCv.js'
-import {
-  autoCropByCornerBackground,
-  enhanceDocumentScanAggressive,
-  polishScannedDocument,
-} from '../lib/scanPreprocess.js'
+import { autoCropByCornerBackground, enhanceDocumentScanAggressive } from '../lib/scanPreprocess.js'
 import '../App.css'
 
 const PDF_SIZE_OPTIONS = [
@@ -21,23 +17,28 @@ const MARGIN_PRESETS = {
   wide: 20,
 }
 
+/** 接近掃描器／列印用 PDF：高檔用 0.95，避免多輪 JPEG 後文字發糊 */
 const JPEG_QUALITY_PRESETS = {
-  high: 0.92,
-  medium: 0.8,
-  low: 0.65,
+  high: 0.95,
+  medium: 0.85,
+  low: 0.68,
 }
 
+/** jsPDF 內嵌圖片串流壓縮；高檔用 SLOW 較利於畫質與檔案平衡 */
 const PDF_IMAGE_COMPRESSION = {
-  high: 'FAST',
+  high: 'SLOW',
   medium: 'MEDIUM',
-  low: 'SLOW',
+  low: 'FAST',
 }
 
-/** 掃描管線用較高解析度；至少此長邊再跑裁切／透視，避免先被壓爛 */
-const SCAN_PIPELINE_MIN_LONG_EDGE = 2600
-const SCAN_PIPELINE_CAP_LONG_EDGE = 3400
-/** PDF 內嵌圖片長邊上限（與「匯入完成後」的頁面品質銜接） */
-const PDF_EXPORT_MAX_LONG_EDGE = 3400
+/** 掃描管線長邊下限（過高會拖慢匯入；與 OpenCV Worker 解碼上限需一致） */
+const SCAN_PIPELINE_MIN_LONG_EDGE = 1800
+/** 約 300dpi A4 長邊量級，與下方表單「圖片長邊上限」上限一致 */
+const SCAN_PIPELINE_CAP_LONG_EDGE = 4000
+/** 送進 OpenCV 前仍用高品質，利於邊緣／透視；列表預覽可另壓縮 */
+const SCAN_PIPELINE_PREJPEG_QUALITY = 'high'
+/** PDF 內嵌圖片長邊上限（從掃描原圖 baseSrc 取樣，宜與管線上限一致） */
+const PDF_EXPORT_MAX_LONG_EDGE = 4000
 
 const COMMON_IMAGE_EXTENSIONS = new Set([
   'jpg',
@@ -69,8 +70,9 @@ function ToolPage() {
   const [pdfMarginPreset, setPdfMarginPreset] = useState('normal')
   const [pdfOutputQuality, setPdfOutputQuality] = useState('high')
   const [pdfFileName, setPdfFileName] = useState('scanned-document')
-  const [maxImageEdge, setMaxImageEdge] = useState(2000)
-  const [imageCompressionQuality, setImageCompressionQuality] = useState('medium')
+  /** 預設接近常見掃描／手機文件頁（長邊約 2400～2600px） */
+  const [maxImageEdge, setMaxImageEdge] = useState(2600)
+  const [imageCompressionQuality, setImageCompressionQuality] = useState('high')
   const [cropTargetId, setCropTargetId] = useState(null)
   const videoRef = useRef(null)
   const streamRef = useRef(null)
@@ -131,7 +133,7 @@ function ToolPage() {
       img.src = dataUrl
     })
 
-  const compressImage = async (dataUrl, maxEdge, qualityPreset) => {
+  const compressImageWithDimensions = async (dataUrl, maxEdge, qualityPreset) => {
     const image = await loadImage(dataUrl)
     const longestEdge = Math.max(image.width, image.height)
     const scale = longestEdge > maxEdge ? maxEdge / longestEdge : 1
@@ -144,14 +146,27 @@ function ToolPage() {
     context.drawImage(image, 0, 0, canvas.width, canvas.height)
 
     const quality = JPEG_QUALITY_PRESETS[qualityPreset] || JPEG_QUALITY_PRESETS.medium
-    return canvas.toDataURL('image/jpeg', quality)
+    return {
+      dataUrl: canvas.toDataURL('image/jpeg', quality),
+      width: canvas.width,
+      height: canvas.height,
+    }
   }
 
-  const toImageItem = (source, fileName = 'photo') => ({
+  const compressImage = async (dataUrl, maxEdge, qualityPreset) => {
+    const { dataUrl: out } = await compressImageWithDimensions(dataUrl, maxEdge, qualityPreset)
+    return out
+  }
+
+  /**
+   * @param {string} displaySrc 列表預覽用（可依「圖片壓縮品質」縮小）
+   * @param {string} fileName
+   * @param {string | null} [fullSrc] 掃描管線輸出；PDF／裁切用，避免預覽壓縮拖累列印品質
+   */
+  const toImageItem = (displaySrc, fileName = 'photo', fullSrc = null) => ({
     id: crypto.randomUUID(),
-    src: source,
-    /** 掃描後原圖；手動裁切永遠由此裁，避免重複 JPEG 損失 */
-    baseSrc: source,
+    src: displaySrc,
+    baseSrc: fullSrc ?? displaySrc,
     name: `${fileName}.jpg`,
   })
 
@@ -193,15 +208,20 @@ function ToolPage() {
   )
 
   /** 匯入／拍照解碼完成 → 高解析度進掃描 → 再決定列表存檔與後續 PDF */
-  const applyScanPipeline = async (dataUrl) => {
+  const applyScanPipeline = async (dataUrl, knownDecodeWH = null) => {
     const qHigh = JPEG_QUALITY_PRESETS.high
     let url = dataUrl
     try {
       await yieldToUi()
-      const openCvUrl = await applyOpenCvDocumentScan(dataUrl, qHigh)
+      const openCvUrl = await applyOpenCvDocumentScan(
+        dataUrl,
+        qHigh,
+        scanPipelineInputLongEdge,
+        knownDecodeWH,
+      )
       if (openCvUrl) {
         await yieldToUi()
-        return await polishScannedDocument(openCvUrl, qHigh)
+        return openCvUrl
       }
       url = await autoCropByCornerBackground(dataUrl, qHigh)
       await yieldToUi()
@@ -215,7 +235,15 @@ function ToolPage() {
   const finalizeImageForList = async (pipelineDataUrl) => {
     const q =
       JPEG_QUALITY_PRESETS[imageCompressionQuality] || JPEG_QUALITY_PRESETS.medium
-    return compressImage(pipelineDataUrl, scanPipelineInputLongEdge, q)
+    const maxEdge = scanPipelineInputLongEdge
+    if (imageCompressionQuality === 'high') {
+      const img = await loadImage(pipelineDataUrl)
+      const longest = Math.max(img.width, img.height)
+      if (longest <= maxEdge) {
+        return pipelineDataUrl
+      }
+    }
+    return compressImage(pipelineDataUrl, maxEdge, imageCompressionQuality)
   }
 
   const cropModalUrl = useMemo(() => {
@@ -233,7 +261,9 @@ function ToolPage() {
         imageCompressionQuality,
       )
       setImages((prev) =>
-        prev.map((im) => (im.id === id ? { ...im, src: compressed } : im)),
+        prev.map((im) =>
+          im.id === id ? { ...im, baseSrc: dataUrl, src: compressed } : im,
+        ),
       )
     },
     [cropTargetId, scanPipelineInputLongEdge, imageCompressionQuality],
@@ -300,15 +330,25 @@ function ToolPage() {
 
         try {
           const normalizedDataUrl = await normalizeUploadFileToDataUrl(file)
-          const scanReadyUrl = await compressImage(
+          await yieldToUi()
+          const {
+            dataUrl: scanReadyUrl,
+            width: scanW,
+            height: scanH,
+          } = await compressImageWithDimensions(
             normalizedDataUrl,
             scanPipelineInputLongEdge,
-            'high',
+            SCAN_PIPELINE_PREJPEG_QUALITY,
           )
-          const pipelineUrl = await applyScanPipeline(scanReadyUrl)
+          await yieldToUi()
+          const pipelineUrl = await applyScanPipeline(scanReadyUrl, {
+            width: scanW,
+            height: scanH,
+          })
+          await yieldToUi()
           const storedUrl = await finalizeImageForList(pipelineUrl)
           const name = getFileBaseName(file.name) || `upload-${index + 1}`
-          successItems.push(toImageItem(storedUrl, name))
+          successItems.push(toImageItem(storedUrl, name, pipelineUrl))
         } catch (error) {
           failItems.push(error)
         }
@@ -376,10 +416,27 @@ function ToolPage() {
 
     try {
       const dataUrl = canvas.toDataURL('image/jpeg', 0.95)
-      const scanReadyUrl = await compressImage(dataUrl, scanPipelineInputLongEdge, 'high')
-      const pipelineUrl = await applyScanPipeline(scanReadyUrl)
+      await yieldToUi()
+      const {
+        dataUrl: scanReadyUrl,
+        width: scanW,
+        height: scanH,
+      } = await compressImageWithDimensions(
+        dataUrl,
+        scanPipelineInputLongEdge,
+        SCAN_PIPELINE_PREJPEG_QUALITY,
+      )
+      await yieldToUi()
+      const pipelineUrl = await applyScanPipeline(scanReadyUrl, {
+        width: scanW,
+        height: scanH,
+      })
+      await yieldToUi()
       const storedUrl = await finalizeImageForList(pipelineUrl)
-      setImages((prev) => [...prev, toImageItem(storedUrl, `capture-${prev.length + 1}`)])
+      setImages((prev) => [
+        ...prev,
+        toImageItem(storedUrl, `capture-${prev.length + 1}`, pipelineUrl),
+      ])
       if (cameraMode === 'single') {
         closeCamera()
       }
@@ -422,7 +479,7 @@ function ToolPage() {
       for (let index = 0; index < images.length; index += 1) {
         const image = images[index]
         const exportSrc = await compressImage(
-          image.src,
+          image.baseSrc ?? image.src,
           PDF_EXPORT_MAX_LONG_EDGE,
           pdfOutputQuality,
         )
@@ -674,9 +731,10 @@ function ToolPage() {
           </label>
         </div>
         <p className="import-pipeline-hint">
-          匯入完成後會先以較高解析度（長邊約 {SCAN_PIPELINE_MIN_LONG_EDGE}～
-          {SCAN_PIPELINE_CAP_LONG_EDGE}px、高品質 JPEG）做紙張偵測、透視與色階，再依上方「圖片壓縮品質」存成列表預覽。每張可點「調整裁切」以
-          3×3 格線微調範圍（選用）。輸出 PDF 時另依「PDF 品質」嵌入（長邊上限 {PDF_EXPORT_MAX_LONG_EDGE}px）。
+          匯入後會以較高解析度（長邊約 {SCAN_PIPELINE_MIN_LONG_EDGE}～
+          {SCAN_PIPELINE_CAP_LONG_EDGE}px、高品質 JPEG）做紙張偵測、透視與色階；列表預覽可依「圖片壓縮品質」縮小，但
+          <strong>輸出 PDF 一律以掃描原圖</strong>（長邊上限 {PDF_EXPORT_MAX_LONG_EDGE}
+          px）再依「PDF 品質」嵌入，較接近掃描器列印效果。每張可點「調整裁切」微調。
         </p>
 
         <div className="toolbar">

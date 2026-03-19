@@ -72,13 +72,25 @@ export function warmUpOpenCv() {
 /**
  * @param {string} dataUrl
  * @param {number} jpegQuality
+ * @param {number} [maxDecodeLongEdge] 與主執行緒壓縮長邊一致，避免先放大再被 Worker 縮回
+ * @param {{ width: number, height: number } | null} [knownDecodeWH] 可加速 Worker 內解碼（略過全圖 probe）
  * @returns {Promise<string|null>}
  */
-export function applyOpenCvDocumentScan(dataUrl, jpegQuality = 0.92) {
+export function applyOpenCvDocumentScan(
+  dataUrl,
+  jpegQuality = 0.92,
+  maxDecodeLongEdge,
+  knownDecodeWH = null,
+) {
   const w = getWorker()
   if (!w) {
     return Promise.resolve(null)
   }
+
+  const edge =
+    typeof maxDecodeLongEdge === 'number' && maxDecodeLongEdge > 0
+      ? Math.min(4500, Math.max(640, Math.round(maxDecodeLongEdge)))
+      : 2000
 
   return new Promise((resolve) => {
     const id = jobSeq++
@@ -91,7 +103,18 @@ export function applyOpenCvDocumentScan(dataUrl, jpegQuality = 0.92) {
 
     pending.set(id, { resolve, timer })
     try {
-      w.postMessage({ id, dataUrl, jpegQuality })
+      w.postMessage({
+        id,
+        dataUrl,
+        jpegQuality,
+        maxDecodeLongEdge: edge,
+        knownDecodeWH:
+          knownDecodeWH &&
+          knownDecodeWH.width > 0 &&
+          knownDecodeWH.height > 0
+            ? { width: knownDecodeWH.width, height: knownDecodeWH.height }
+            : undefined,
+      })
     } catch {
       clearTimeout(timer)
       pending.delete(id)
