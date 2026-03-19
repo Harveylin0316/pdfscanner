@@ -49,6 +49,7 @@ function App() {
   const [isExporting, setIsExporting] = useState(false)
   const [isProcessingImages, setIsProcessingImages] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(null)
+  const [downloadNotice, setDownloadNotice] = useState(null)
   const [errorMessage, setErrorMessage] = useState('')
   const [pdfPageSize, setPdfPageSize] = useState('a4')
   const [pdfMarginPreset, setPdfMarginPreset] = useState('normal')
@@ -71,6 +72,15 @@ function App() {
       stopCamera()
     }
   }, [])
+
+  useEffect(
+    () => () => {
+      if (downloadNotice?.url) {
+        URL.revokeObjectURL(downloadNotice.url)
+      }
+    },
+    [downloadNotice],
+  )
 
   useEffect(() => {
     if (isCameraOpen && videoRef.current && streamRef.current) {
@@ -167,6 +177,36 @@ function App() {
     const normalized = value.trim().replace(/[\\/:*?"<>|]+/g, '-')
     if (!normalized) return 'scanned-document.pdf'
     return normalized.toLowerCase().endsWith('.pdf') ? normalized : `${normalized}.pdf`
+  }
+
+  const triggerDownload = (url, fileName) => {
+    const link = document.createElement('a')
+    link.href = url
+    link.download = fileName
+    link.target = '_blank'
+    link.rel = 'noopener noreferrer'
+    link.click()
+  }
+
+  const notifyDownloadReady = async (fileName, url) => {
+    if (!('Notification' in window)) return
+
+    try {
+      let permission = Notification.permission
+      if (permission === 'default') {
+        permission = await Notification.requestPermission()
+      }
+      if (permission !== 'granted') return
+
+      const notification = new Notification('PDF 已準備好', {
+        body: `點一下下載 ${fileName}`,
+      })
+      notification.onclick = () => {
+        window.open(url, '_blank', 'noopener,noreferrer')
+      }
+    } catch {
+      // Ignore notification errors and keep in-page download notice as fallback.
+    }
   }
 
   const stopCamera = () => {
@@ -353,7 +393,19 @@ function App() {
         )
       }
 
-      pdf.save(getSafeFileName(pdfFileName))
+      const safeFileName = getSafeFileName(pdfFileName)
+      const blob = pdf.output('blob')
+      const objectUrl = URL.createObjectURL(blob)
+
+      setDownloadNotice((prev) => {
+        if (prev?.url) {
+          URL.revokeObjectURL(prev.url)
+        }
+        return { fileName: safeFileName, url: objectUrl }
+      })
+
+      triggerDownload(objectUrl, safeFileName)
+      await notifyDownloadReady(safeFileName, objectUrl)
     } catch (error) {
       setErrorMessage(error.message || 'PDF 產生失敗，請稍後再試。')
     } finally {
@@ -565,6 +617,19 @@ function App() {
             {isExporting ? '輸出中...' : '輸出 PDF'}
           </button>
         </div>
+        {downloadNotice && (
+          <div className="download-notice">
+            <strong>下載提醒</strong>
+            <span>若手機沒有自動下載，請點下方按鈕手動下載。</span>
+            <button
+              type="button"
+              className="button primary"
+              onClick={() => triggerDownload(downloadNotice.url, downloadNotice.fileName)}
+            >
+              下載 {downloadNotice.fileName}
+            </button>
+          </div>
+        )}
         {errorMessage && <p className="error">{errorMessage}</p>}
       </section>
 

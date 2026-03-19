@@ -119,6 +119,26 @@ label.button input {
   height: 9px;
 }
 
+.download-notice {
+  margin-top: 12px;
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+  border-radius: 10px;
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+  text-align: left;
+}
+
+.download-notice strong {
+  color: #1d4ed8;
+}
+
+.download-notice span {
+  font-size: 13px;
+  color: #334155;
+}
+
 .toolbar {
   margin-top: 14px;
   display: flex;
