@@ -1,8 +1,7 @@
 /**
  * 匯入效能：多路徑降採樣後再送 OpenCV Worker。
- * 1) 檔頭讀尺寸 + createImageBitmap resize
- * 2) ImageDecoder（AVIF／部分 WebP 等，瀏覽器支援時）desiredWidth/Height
- * 3) 完整解碼後 canvas 縮圖（最後備援）
+ * 注意：部分瀏覽器對 PNG／GIF 使用 createImageBitmap(blob, { resizeWidth, resizeHeight })
+ * 會長時間阻塞主執行緒（看似當機），故這類格式改走 ImageDecoder 或「全解碼 + canvas 縮圖」。
  */
 
 import {
@@ -106,6 +105,14 @@ function mimeFromDataUrl(dataUrl) {
 }
 
 /**
+ * PNG／GIF：避免 createImageBitmap(blob, resize*) 造成主執行緒假死（Chromium / WebKit 已知行為差異大）。
+ */
+function shouldSkipBitmapDecodeResize(mime) {
+  const m = (mime || '').toLowerCase().split(';')[0].trim()
+  return m === 'image/png' || m === 'image/gif'
+}
+
+/**
  * @param {File | Blob | string} input
  * @param {number} maxLongEdge
  * @param {string} [mimeHint] 建議傳 File.type；data URL 可省略（自動從字串解析）
@@ -130,37 +137,50 @@ export async function createScaledScanBitmap(input, maxLongEdge, mimeHint = '') 
     }
   }
 
+  const effectiveMime = resolvedMime || (await sniffImageMimeTypeFromBlob(blob))
+  const skipDecodeResize = shouldSkipBitmapDecodeResize(effectiveMime)
+
   const probed = await probeImageDimensionsFromBlob(blob)
+  let targetW = 0
+  let targetH = 0
+  let needsDownscale = false
   if (probed && probed.w > 0 && probed.h > 0) {
     const nw = probed.w
     const nh = probed.h
     const scale = Math.min(1, edge / Math.max(nw, nh))
-    const w = Math.max(1, Math.round(nw * scale))
-    const h = Math.max(1, Math.round(nh * scale))
+    targetW = Math.max(1, Math.round(nw * scale))
+    targetH = Math.max(1, Math.round(nh * scale))
+    needsDownscale = scale < 1
+  }
 
-    if (scale < 1) {
-      try {
-        const bitmap = await createImageBitmap(blob, {
-          resizeWidth: w,
-          resizeHeight: h,
-          resizeQuality: 'high',
-        })
-        return { bitmap, width: w, height: h }
-      } catch {
-        /* continue */
-      }
-    } else {
-      try {
-        const bitmap = await createImageBitmap(blob)
-        return { bitmap, width: w, height: h }
-      } catch {
-        /* continue */
-      }
+  /** JPEG／WebP／BMP 等：decode 時順便縮放（快） */
+  if (needsDownscale && probed && !skipDecodeResize) {
+    try {
+      const bitmap = await createImageBitmap(blob, {
+        resizeWidth: targetW,
+        resizeHeight: targetH,
+      })
+      return { bitmap, width: targetW, height: targetH }
+    } catch {
+      /* 改走 ImageDecoder 或 canvas */
     }
   }
 
-  const dec = await tryImageDecoderScaledBitmap(blob, edge, resolvedMime)
-  if (dec) return dec
+  /** 需縮放但跳過上一段，或無法由檔頭得知尺寸：ImageDecoder（PNG／AVIF 等常較穩） */
+  if ((needsDownscale && probed) || !probed) {
+    const dec = await tryImageDecoderScaledBitmap(blob, edge, effectiveMime)
+    if (dec) return dec
+  }
+
+  /** 已探得不必縮放：直接解一張 */
+  if (probed && !needsDownscale) {
+    try {
+      const bitmap = await createImageBitmap(blob)
+      return { bitmap, width: bitmap.width, height: bitmap.height }
+    } catch {
+      /* fall through */
+    }
+  }
 
   let bitmap = await createImageBitmap(blob)
 
