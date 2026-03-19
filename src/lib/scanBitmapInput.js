@@ -1,7 +1,12 @@
 /**
- * 匯入效能：用 ImageBitmap 單次解碼＋縮放，避免先 readAsDataURL 再 JPEG 再給 Worker 二次解碼。
- * 回傳的 bitmap 須由呼叫端 transfer 給 Worker 或手動 close。
- *
+ * 匯入效能：ImageBitmap 送 OpenCV Worker。
+ * 對 PNG／JPEG 等可先由檔頭得知像素尺寸，再用 createImageBitmap 的 resize 選項解碼，
+ * 避免「1.x MB 但八千萬像素」類大圖在主執行緒全尺寸解碼卡死。
+ */
+
+import { probeImageDimensionsFromBlob } from './imageDimensionsProbe.js'
+
+/**
  * @param {File | Blob | string} input File／Blob，或 data URL 字串
  * @param {number} maxLongEdge
  * @returns {Promise<{ bitmap: ImageBitmap, width: number, height: number }>}
@@ -9,13 +14,44 @@
 export async function createScaledScanBitmap(input, maxLongEdge) {
   const edge = Math.max(320, Math.min(4500, Math.round(maxLongEdge || 2000)))
 
-  let bitmap
+  let blob
   if (typeof input === 'string') {
     const res = await fetch(input)
-    bitmap = await createImageBitmap(await res.blob())
+    blob = await res.blob()
   } else {
-    bitmap = await createImageBitmap(input)
+    blob = input
   }
+
+  const probed = await probeImageDimensionsFromBlob(blob)
+  if (probed && probed.w > 0 && probed.h > 0) {
+    const nw = probed.w
+    const nh = probed.h
+    const scale = Math.min(1, edge / Math.max(nw, nh))
+    const w = Math.max(1, Math.round(nw * scale))
+    const h = Math.max(1, Math.round(nh * scale))
+
+    if (scale < 1) {
+      try {
+        const bitmap = await createImageBitmap(blob, {
+          resizeWidth: w,
+          resizeHeight: h,
+          resizeQuality: 'high',
+        })
+        return { bitmap, width: w, height: h }
+      } catch {
+        /* 不支援 resize 選項時改走下方完整解碼 */
+      }
+    } else {
+      try {
+        const bitmap = await createImageBitmap(blob)
+        return { bitmap, width: w, height: h }
+      } catch {
+        /* fall through */
+      }
+    }
+  }
+
+  let bitmap = await createImageBitmap(blob)
 
   try {
     const nw = bitmap.width
