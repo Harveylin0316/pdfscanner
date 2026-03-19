@@ -25,9 +25,27 @@ const PDF_IMAGE_COMPRESSION = {
   low: 'SLOW',
 }
 
+const COMMON_IMAGE_EXTENSIONS = new Set([
+  'jpg',
+  'jpeg',
+  'png',
+  'webp',
+  'gif',
+  'bmp',
+  'avif',
+  'svg',
+  'tif',
+  'tiff',
+  'ico',
+  'jfif',
+  'pjpeg',
+  'pjp',
+])
+
 function App() {
   const [images, setImages] = useState([])
   const [isCameraOpen, setIsCameraOpen] = useState(false)
+  const [cameraMode, setCameraMode] = useState('single')
   const [isExporting, setIsExporting] = useState(false)
   const [isProcessingImages, setIsProcessingImages] = useState(false)
   const [errorMessage, setErrorMessage] = useState('')
@@ -39,6 +57,8 @@ function App() {
   const [imageCompressionQuality, setImageCompressionQuality] = useState('medium')
   const videoRef = useRef(null)
   const streamRef = useRef(null)
+  const uploadSingleInputRef = useRef(null)
+  const uploadBatchInputRef = useRef(null)
 
   const imageCountLabel = useMemo(() => {
     if (images.length === 0) return '尚未加入圖片'
@@ -57,13 +77,15 @@ function App() {
     }
   }, [isCameraOpen])
 
-  const readFileAsDataUrl = (file) =>
+  const readBlobAsDataUrl = (blob, fileName = 'image') =>
     new Promise((resolve, reject) => {
       const reader = new FileReader()
       reader.onload = () => resolve(reader.result)
-      reader.onerror = () => reject(new Error(`無法讀取檔案：${file.name}`))
-      reader.readAsDataURL(file)
+      reader.onerror = () => reject(new Error(`無法讀取檔案：${fileName}`))
+      reader.readAsDataURL(blob)
     })
+
+  const readFileAsDataUrl = (file) => readBlobAsDataUrl(file, file.name)
 
   const loadImage = (dataUrl) =>
     new Promise((resolve, reject) => {
@@ -95,6 +117,51 @@ function App() {
     name: `${fileName}.jpg`,
   })
 
+  const getFileBaseName = (fileName) => fileName.replace(/\.[^.]+$/, '')
+
+  const getFileExtension = (fileName) => {
+    const matched = fileName.toLowerCase().match(/\.([^.]+)$/)
+    return matched?.[1] || ''
+  }
+
+  const isHeicFile = (file) => {
+    const type = (file.type || '').toLowerCase()
+    const extension = getFileExtension(file.name)
+    return (
+      type.includes('image/heic') ||
+      type.includes('image/heif') ||
+      extension === 'heic' ||
+      extension === 'heif'
+    )
+  }
+
+  const isLikelyImageFile = (file) => {
+    if ((file.type || '').startsWith('image/')) return true
+    return COMMON_IMAGE_EXTENSIONS.has(getFileExtension(file.name))
+  }
+
+  const convertHeicToJpegDataUrl = async (file) => {
+    const module = await import('heic2any')
+    const heic2any = module.default
+    const converted = await heic2any({
+      blob: file,
+      toType: 'image/jpeg',
+      quality: 0.95,
+    })
+    const jpegBlob = Array.isArray(converted) ? converted[0] : converted
+    return readBlobAsDataUrl(jpegBlob, file.name)
+  }
+
+  const normalizeUploadFileToDataUrl = async (file) => {
+    if (isHeicFile(file)) {
+      return convertHeicToJpegDataUrl(file)
+    }
+    if (isLikelyImageFile(file)) {
+      return readFileAsDataUrl(file)
+    }
+    throw new Error(`不支援的檔案格式：${file.name}`)
+  }
+
   const getSafeFileName = (value) => {
     const normalized = value.trim().replace(/[\\/:*?"<>|]+/g, '-')
     if (!normalized) return 'scanned-document.pdf'
@@ -108,22 +175,44 @@ function App() {
     streamRef.current = null
   }
 
-  const handleUpload = async (event) => {
+  const handleUpload = async (event, mode = 'batch') => {
     const files = Array.from(event.target.files || [])
     if (files.length === 0) return
 
     setErrorMessage('')
     setIsProcessingImages(true)
     try {
-      const dataUrls = await Promise.all(files.map((file) => readFileAsDataUrl(file)))
-      const compressedUrls = await Promise.all(
-        dataUrls.map((url) => compressImage(url, maxImageEdge, imageCompressionQuality)),
+      const targetFiles = mode === 'single' ? files.slice(0, 1) : files
+      const results = await Promise.allSettled(
+        targetFiles.map(async (file, index) => {
+          const normalizedDataUrl = await normalizeUploadFileToDataUrl(file)
+          const compressedDataUrl = await compressImage(
+            normalizedDataUrl,
+            maxImageEdge,
+            imageCompressionQuality,
+          )
+          const name = getFileBaseName(file.name) || `upload-${index + 1}`
+          return toImageItem(compressedDataUrl, name)
+        }),
       )
-      const newImages = compressedUrls.map((url, index) => {
-        const name = files[index]?.name?.replace(/\.[^.]+$/, '') || `upload-${index + 1}`
-        return toImageItem(url, name)
-      })
-      setImages((prev) => [...prev, ...newImages])
+
+      const successItems = results
+        .filter((result) => result.status === 'fulfilled')
+        .map((result) => result.value)
+      const failItems = results.filter((result) => result.status === 'rejected')
+
+      if (successItems.length > 0) {
+        setImages((prev) => [...prev, ...successItems])
+      }
+
+      if (failItems.length > 0) {
+        const names = failItems
+          .slice(0, 3)
+          .map((result) => result.reason?.message?.replace('不支援的檔案格式：', '') || '未知檔案')
+          .join('、')
+        const suffix = failItems.length > 3 ? '...' : ''
+        setErrorMessage(`有 ${failItems.length} 個檔案匯入失敗：${names}${suffix}`)
+      }
     } catch (error) {
       setErrorMessage(error.message || '上傳失敗，請再試一次。')
     } finally {
@@ -132,8 +221,9 @@ function App() {
     }
   }
 
-  const startCamera = async () => {
+  const startCamera = async (mode) => {
     setErrorMessage('')
+    setCameraMode(mode)
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: 'environment' },
@@ -151,6 +241,7 @@ function App() {
 
   const closeCamera = () => {
     setIsCameraOpen(false)
+    setCameraMode('single')
     if (videoRef.current) {
       videoRef.current.srcObject = null
     }
@@ -173,6 +264,9 @@ function App() {
       const dataUrl = canvas.toDataURL('image/jpeg', 0.95)
       const compressed = await compressImage(dataUrl, maxImageEdge, imageCompressionQuality)
       setImages((prev) => [...prev, toImageItem(compressed, `capture-${prev.length + 1}`)])
+      if (cameraMode === 'single') {
+        closeCamera()
+      }
     } catch (error) {
       setErrorMessage(error.message || '拍照處理失敗，請再試一次。')
     } finally {
@@ -259,26 +353,60 @@ function App() {
 
       <section className="card controls">
         <div className="button-group">
-          <label className="button secondary">
-            上傳圖片
-            <input
-              type="file"
-              accept="image/*"
-              multiple
-              onChange={handleUpload}
-              disabled={isProcessingImages}
-            />
-          </label>
+          <button
+            type="button"
+            className="button secondary"
+            onClick={() => uploadSingleInputRef.current?.click()}
+            disabled={isProcessingImages}
+          >
+            上傳單張
+          </button>
+          <input
+            ref={uploadSingleInputRef}
+            type="file"
+            accept="image/*,.heic,.heif"
+            onChange={(event) => handleUpload(event, 'single')}
+            disabled={isProcessingImages}
+            className="hidden-file-input"
+          />
+
+          <button
+            type="button"
+            className="button secondary"
+            onClick={() => uploadBatchInputRef.current?.click()}
+            disabled={isProcessingImages}
+          >
+            上傳批次
+          </button>
+          <input
+            ref={uploadBatchInputRef}
+            type="file"
+            accept="image/*,.heic,.heif"
+            multiple
+            onChange={(event) => handleUpload(event, 'batch')}
+            disabled={isProcessingImages}
+            className="hidden-file-input"
+          />
 
           {!isCameraOpen ? (
-            <button
-              type="button"
-              className="button secondary"
-              onClick={startCamera}
-              disabled={isProcessingImages}
-            >
-              開啟相機
-            </button>
+            <>
+              <button
+                type="button"
+                className="button secondary"
+                onClick={() => startCamera('single')}
+                disabled={isProcessingImages}
+              >
+                相機單拍
+              </button>
+              <button
+                type="button"
+                className="button secondary"
+                onClick={() => startCamera('batch')}
+                disabled={isProcessingImages}
+              >
+                相機批拍
+              </button>
+            </>
           ) : (
             <>
               <button
@@ -287,7 +415,7 @@ function App() {
                 onClick={capturePhoto}
                 disabled={isProcessingImages}
               >
-                {isProcessingImages ? '處理中...' : '拍照'}
+                {isProcessingImages ? '處理中...' : cameraMode === 'single' ? '拍照（單拍）' : '拍照（批拍）'}
               </button>
               <button type="button" className="button ghost" onClick={closeCamera}>
                 關閉相機
@@ -298,6 +426,7 @@ function App() {
 
         {isCameraOpen && (
           <div className="camera-box">
+            <div className="camera-mode">{cameraMode === 'single' ? '目前模式：單拍' : '目前模式：批拍'}</div>
             <video ref={videoRef} autoPlay playsInline muted />
           </div>
         )}
