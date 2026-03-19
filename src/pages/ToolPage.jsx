@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { jsPDF } from 'jspdf'
 import { convertHeicToJpegDataUrl } from '../lib/heicConvert.js'
+import { applyOpenCvDocumentScan } from '../lib/documentScanOpenCv.js'
 import { autoCropByCornerBackground, enhanceDocumentScan } from '../lib/scanPreprocess.js'
 import '../App.css'
 
@@ -61,6 +62,7 @@ function ToolPage() {
   const [imageCompressionQuality, setImageCompressionQuality] = useState('medium')
   const [scanDocumentEnhance, setScanDocumentEnhance] = useState(true)
   const [scanAutoCrop, setScanAutoCrop] = useState(false)
+  const [scanOpenCvMode, setScanOpenCvMode] = useState(true)
   const videoRef = useRef(null)
   const streamRef = useRef(null)
   const uploadSingleInputRef = useRef(null)
@@ -159,6 +161,12 @@ function ToolPage() {
     const q = JPEG_QUALITY_PRESETS[imageCompressionQuality] || JPEG_QUALITY_PRESETS.medium
     let url = dataUrl
     try {
+      if (scanOpenCvMode) {
+        const openCvUrl = await applyOpenCvDocumentScan(dataUrl, q)
+        if (openCvUrl) {
+          return openCvUrl
+        }
+      }
       if (scanAutoCrop) {
         url = await autoCropByCornerBackground(url, q)
       }
@@ -194,27 +202,6 @@ function ToolPage() {
     link.target = '_blank'
     link.rel = 'noopener noreferrer'
     link.click()
-  }
-
-  const notifyDownloadReady = async (fileName, url) => {
-    if (!('Notification' in window)) return
-
-    try {
-      let permission = Notification.permission
-      if (permission === 'default') {
-        permission = await Notification.requestPermission()
-      }
-      if (permission !== 'granted') return
-
-      const notification = new Notification('PDF 已準備好', {
-        body: `點一下下載 ${fileName}`,
-      })
-      notification.onclick = () => {
-        window.open(url, '_blank', 'noopener,noreferrer')
-      }
-    } catch {
-      // Ignore notification errors and keep in-page download notice as fallback.
-    }
   }
 
   const stopCamera = () => {
@@ -417,7 +404,6 @@ function ToolPage() {
       })
 
       triggerDownload(objectUrl, safeFileName)
-      await notifyDownloadReady(safeFileName, objectUrl)
     } catch (error) {
       setErrorMessage(error.message || 'PDF 產生失敗，請稍後再試。')
     } finally {
@@ -628,10 +614,20 @@ function ToolPage() {
           <label className="check-row">
             <input
               type="checkbox"
+              checked={scanOpenCvMode}
+              onChange={(event) => setScanOpenCvMode(event.target.checked)}
+            />
+            <span>
+              掃描器模式（自動偵測紙張邊緣、透視校正、淨白背景；成功時不再套用下方兩項）
+            </span>
+          </label>
+          <label className="check-row">
+            <input
+              type="checkbox"
               checked={scanDocumentEnhance}
               onChange={(event) => setScanDocumentEnhance(event.target.checked)}
             />
-            <span>文件加強（提高對比與可讀性）</span>
+            <span>文件加強（OpenCV 失敗時：提高對比與可讀性）</span>
           </label>
           <label className="check-row">
             <input
@@ -639,10 +635,13 @@ function ToolPage() {
               checked={scanAutoCrop}
               onChange={(event) => setScanAutoCrop(event.target.checked)}
             />
-            <span>簡易自動裁切（從邊緣「桌面」推斷紙張範圍；白紙＋單色桌面較準）</span>
+            <span>
+              簡易自動裁切（OpenCV 失敗時：從邊緣桌面推斷紙張；白紙＋單色桌面較準）
+            </span>
           </label>
           <p className="scan-hint">
-            HEIC 已改用較新的解碼器優先處理；若仍失敗，請到 iPhone「設定 → 相機 → 格式」改為「最佳相容性」。
+            掃描器模式首次載入會下載較大的影像函式庫，請稍候。HEIC
+            在背景解碼；若失敗請到 iPhone「設定 → 相機 → 格式」改為「最佳相容性」。
           </p>
         </div>
 
