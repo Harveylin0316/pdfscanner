@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Link } from 'react-router-dom'
 import { jsPDF } from 'jspdf'
 import { autoCropByCornerBackground, enhanceDocumentScan } from '../lib/scanPreprocess.js'
 import '../App.css'
@@ -478,13 +477,7 @@ function ToolPage() {
   return (
     <main className="app">
       <header className="header">
-        <div className="tool-nav">
-          <Link className="button ghost" to="/">
-            返回首頁
-          </Link>
-          <span>Step 2 / 3：調整並輸出 PDF</span>
-        </div>
-        <h1>掃描工具頁</h1>
+        <h1>照片轉 PDF</h1>
         <p>上傳或拍照後，調整順序與輸出設定，一鍵匯出 PDF。</p>
       </header>
 
