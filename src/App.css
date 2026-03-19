@@ -14,6 +14,19 @@
   color: #64748b;
 }
 
+.tool-nav {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.tool-nav span {
+  color: #475569;
+  font-size: 14px;
+}
+
 .card {
   background: #fff;
   border: 1px solid #e2e8f0;
