@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { jsPDF } from 'jspdf'
+import { autoCropByCornerBackground, enhanceDocumentScan } from '../lib/scanPreprocess.js'
 import '../App.css'
 
 const PDF_SIZE_OPTIONS = [
@@ -58,6 +59,8 @@ function ToolPage() {
   const [pdfFileName, setPdfFileName] = useState('scanned-document')
   const [maxImageEdge, setMaxImageEdge] = useState(2000)
   const [imageCompressionQuality, setImageCompressionQuality] = useState('medium')
+  const [scanDocumentEnhance, setScanDocumentEnhance] = useState(true)
+  const [scanAutoCrop, setScanAutoCrop] = useState(false)
   const videoRef = useRef(null)
   const streamRef = useRef(null)
   const uploadSingleInputRef = useRef(null)
@@ -153,15 +156,71 @@ function ToolPage() {
   }
 
   const convertHeicToJpegDataUrl = async (file) => {
-    const module = await import('heic2any')
-    const heic2any = module.default
-    const converted = await heic2any({
-      blob: file,
-      toType: 'image/jpeg',
-      quality: 0.95,
-    })
-    const jpegBlob = Array.isArray(converted) ? converted[0] : converted
-    return readBlobAsDataUrl(jpegBlob, file.name)
+    const tryHeicTo = async () => {
+      const { heicTo } = await import('heic-to')
+      const jpegBlob = await heicTo({ blob: file, type: 'image/jpeg', quality: 0.92 })
+      if (!jpegBlob || jpegBlob.size === 0) throw new Error('heic-to empty')
+      return readBlobAsDataUrl(jpegBlob, file.name)
+    }
+
+    const tryHeic2Any = async () => {
+      const module = await import('heic2any')
+      const heic2any = module.default
+      const converted = await heic2any({
+        blob: file,
+        toType: 'image/jpeg',
+        quality: 0.95,
+      })
+      const jpegBlob = Array.isArray(converted) ? converted[0] : converted
+      return readBlobAsDataUrl(jpegBlob, file.name)
+    }
+
+    const tryNativeBitmap = async () => {
+      const bitmap = await createImageBitmap(file)
+      const canvas = document.createElement('canvas')
+      canvas.width = bitmap.width
+      canvas.height = bitmap.height
+      const ctx = canvas.getContext('2d')
+      ctx.drawImage(bitmap, 0, 0)
+      bitmap.close()
+      return canvas.toDataURL('image/jpeg', 0.92)
+    }
+
+    try {
+      return await tryHeicTo()
+    } catch {
+      /* newer iOS HEIC often fails on heic2any; heic-to first */
+    }
+    try {
+      return await tryHeic2Any()
+    } catch {
+      /* legacy fallback */
+    }
+    try {
+      return await tryNativeBitmap()
+    } catch {
+      /* Safari may decode HEIC here */
+    }
+
+    throw new Error(
+      `HEIC 無法解碼：${file.name}。建議到 iPhone「設定 → 相機 → 格式」改為「最佳相容性」，或先用「照片」分享成 JPG 再上傳。`,
+    )
+  }
+
+  const applyScanPipeline = async (dataUrl) => {
+    const q = JPEG_QUALITY_PRESETS[imageCompressionQuality] || JPEG_QUALITY_PRESETS.medium
+    let url = dataUrl
+    try {
+      if (scanAutoCrop) {
+        url = await autoCropByCornerBackground(url, q)
+      }
+      if (scanDocumentEnhance) {
+        url = await enhanceDocumentScan(url, q)
+      }
+    } catch {
+      return dataUrl
+    }
+    return url
   }
 
   const normalizeUploadFileToDataUrl = async (file) => {
@@ -246,8 +305,9 @@ function ToolPage() {
 
         try {
           const normalizedDataUrl = await normalizeUploadFileToDataUrl(file)
+          const pipelineUrl = await applyScanPipeline(normalizedDataUrl)
           const compressedDataUrl = await compressImage(
-            normalizedDataUrl,
+            pipelineUrl,
             maxImageEdge,
             imageCompressionQuality,
           )
@@ -320,7 +380,8 @@ function ToolPage() {
 
     try {
       const dataUrl = canvas.toDataURL('image/jpeg', 0.95)
-      const compressed = await compressImage(dataUrl, maxImageEdge, imageCompressionQuality)
+      const pipelineUrl = await applyScanPipeline(dataUrl)
+      const compressed = await compressImage(pipelineUrl, maxImageEdge, imageCompressionQuality)
       setImages((prev) => [...prev, toImageItem(compressed, `capture-${prev.length + 1}`)])
       if (cameraMode === 'single') {
         closeCamera()
@@ -611,6 +672,29 @@ function ToolPage() {
               <option value="low">低</option>
             </select>
           </label>
+        </div>
+
+        <div className="scan-options">
+          <p className="scan-options-title">掃描品質（匯入／拍照當下套用）</p>
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={scanDocumentEnhance}
+              onChange={(event) => setScanDocumentEnhance(event.target.checked)}
+            />
+            <span>文件加強（提高對比與可讀性）</span>
+          </label>
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={scanAutoCrop}
+              onChange={(event) => setScanAutoCrop(event.target.checked)}
+            />
+            <span>簡易自動裁切（從邊緣「桌面」推斷紙張範圍；白紙＋單色桌面較準）</span>
+          </label>
+          <p className="scan-hint">
+            HEIC 已改用較新的解碼器優先處理；若仍失敗，請到 iPhone「設定 → 相機 → 格式」改為「最佳相容性」。
+          </p>
         </div>
 
         <div className="toolbar">
