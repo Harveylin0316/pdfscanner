@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { jsPDF } from 'jspdf'
+import { convertHeicToJpegDataUrl } from '../lib/heicConvert.js'
 import { autoCropByCornerBackground, enhanceDocumentScan } from '../lib/scanPreprocess.js'
 import '../App.css'
 
@@ -154,58 +155,6 @@ function ToolPage() {
     return COMMON_IMAGE_EXTENSIONS.has(getFileExtension(file.name))
   }
 
-  const convertHeicToJpegDataUrl = async (file) => {
-    const tryHeicTo = async () => {
-      const { heicTo } = await import('heic-to')
-      const jpegBlob = await heicTo({ blob: file, type: 'image/jpeg', quality: 0.92 })
-      if (!jpegBlob || jpegBlob.size === 0) throw new Error('heic-to empty')
-      return readBlobAsDataUrl(jpegBlob, file.name)
-    }
-
-    const tryHeic2Any = async () => {
-      const module = await import('heic2any')
-      const heic2any = module.default
-      const converted = await heic2any({
-        blob: file,
-        toType: 'image/jpeg',
-        quality: 0.95,
-      })
-      const jpegBlob = Array.isArray(converted) ? converted[0] : converted
-      return readBlobAsDataUrl(jpegBlob, file.name)
-    }
-
-    const tryNativeBitmap = async () => {
-      const bitmap = await createImageBitmap(file)
-      const canvas = document.createElement('canvas')
-      canvas.width = bitmap.width
-      canvas.height = bitmap.height
-      const ctx = canvas.getContext('2d')
-      ctx.drawImage(bitmap, 0, 0)
-      bitmap.close()
-      return canvas.toDataURL('image/jpeg', 0.92)
-    }
-
-    try {
-      return await tryHeicTo()
-    } catch {
-      /* newer iOS HEIC often fails on heic2any; heic-to first */
-    }
-    try {
-      return await tryHeic2Any()
-    } catch {
-      /* legacy fallback */
-    }
-    try {
-      return await tryNativeBitmap()
-    } catch {
-      /* Safari may decode HEIC here */
-    }
-
-    throw new Error(
-      `HEIC 無法解碼：${file.name}。建議到 iPhone「設定 → 相機 → 格式」改為「最佳相容性」，或先用「照片」分享成 JPG 再上傳。`,
-    )
-  }
-
   const applyScanPipeline = async (dataUrl) => {
     const q = JPEG_QUALITY_PRESETS[imageCompressionQuality] || JPEG_QUALITY_PRESETS.medium
     let url = dataUrl
@@ -224,7 +173,7 @@ function ToolPage() {
 
   const normalizeUploadFileToDataUrl = async (file) => {
     if (isHeicFile(file)) {
-      return convertHeicToJpegDataUrl(file)
+      return convertHeicToJpegDataUrl(file, maxImageEdge)
     }
     if (isLikelyImageFile(file)) {
       return readFileAsDataUrl(file)
@@ -291,6 +240,7 @@ function ToolPage() {
         total: targetFiles.length,
         current: 0,
         currentFileName: '',
+        isHeic: false,
       })
 
       for (let index = 0; index < targetFiles.length; index += 1) {
@@ -300,18 +250,19 @@ function ToolPage() {
           total: targetFiles.length,
           current: index + 1,
           currentFileName: file.name,
+          isHeic: isHeicFile(file),
         })
 
         try {
           const normalizedDataUrl = await normalizeUploadFileToDataUrl(file)
-          const pipelineUrl = await applyScanPipeline(normalizedDataUrl)
-          const compressedDataUrl = await compressImage(
-            pipelineUrl,
+          const scaledUrl = await compressImage(
+            normalizedDataUrl,
             maxImageEdge,
             imageCompressionQuality,
           )
+          const pipelineUrl = await applyScanPipeline(scaledUrl)
           const name = getFileBaseName(file.name) || `upload-${index + 1}`
-          successItems.push(toImageItem(compressedDataUrl, name))
+          successItems.push(toImageItem(pipelineUrl, name))
         } catch (error) {
           failItems.push(error)
         }
@@ -379,9 +330,9 @@ function ToolPage() {
 
     try {
       const dataUrl = canvas.toDataURL('image/jpeg', 0.95)
-      const pipelineUrl = await applyScanPipeline(dataUrl)
-      const compressed = await compressImage(pipelineUrl, maxImageEdge, imageCompressionQuality)
-      setImages((prev) => [...prev, toImageItem(compressed, `capture-${prev.length + 1}`)])
+      const scaledUrl = await compressImage(dataUrl, maxImageEdge, imageCompressionQuality)
+      const pipelineUrl = await applyScanPipeline(scaledUrl)
+      setImages((prev) => [...prev, toImageItem(pipelineUrl, `capture-${prev.length + 1}`)])
       if (cameraMode === 'single') {
         closeCamera()
       }
@@ -597,6 +548,11 @@ function ToolPage() {
               <span>{uploadProgress.currentFileName}</span>
             </div>
             <progress value={uploadProgress.current} max={uploadProgress.total} />
+            {uploadProgress.isHeic && (
+              <p className="progress-heic-hint">
+                HEIC 在背景執行解碼（不會凍結畫面），依照片大小約需數秒至數十秒；可將下方「圖片長邊上限」調低以加快處理。
+              </p>
+            )}
           </div>
         )}
 

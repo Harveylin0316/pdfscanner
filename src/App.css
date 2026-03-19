@@ -119,6 +119,13 @@ label.button input {
   height: 9px;
 }
 
+.progress-heic-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.4;
+}
+
 .download-notice {
   margin-top: 12px;
   border: 1px solid #bfdbfe;
