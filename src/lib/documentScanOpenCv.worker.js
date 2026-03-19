@@ -1,7 +1,10 @@
 /**
  * OpenCV 掃描於 Web Worker 執行，避免 WASM 卡住主執行緒（整頁凍結）
  */
-import { runDocumentScanPipeline } from './documentScanOpenCvCore.js'
+import {
+  runDocumentScanPipeline,
+  runDocumentScanPipelineFromRgbaMat,
+} from './documentScanOpenCvCore.js'
 
 const OPENCV_INIT_TIMEOUT_MS = 90_000
 
@@ -71,7 +74,8 @@ async function drainInbox() {
   try {
     while (inbox.length > 0) {
       const event = inbox.shift()
-      const { id, type, dataUrl, jpegQuality, maxDecodeLongEdge, knownDecodeWH } = event.data || {}
+      const { id, type, dataUrl, jpegQuality, maxDecodeLongEdge, knownDecodeWH, bitmap } =
+        event.data || {}
 
       if (type === 'warmup') {
         try {
@@ -89,6 +93,41 @@ async function drainInbox() {
           self.postMessage({ id, result: null })
           continue
         }
+
+        if (bitmap instanceof ImageBitmap) {
+          let bmp = bitmap
+          try {
+            const w = bmp.width
+            const h = bmp.height
+            if (!w || !h) {
+              try {
+                bmp.close()
+              } catch {
+                /* ignore */
+              }
+              self.postMessage({ id, result: null })
+              continue
+            }
+            const oc = new OffscreenCanvas(w, h)
+            const ctx = oc.getContext('2d')
+            ctx.drawImage(bmp, 0, 0)
+            bmp.close()
+            bmp = null
+            const imageData = ctx.getImageData(0, 0, w, h)
+            const src = cv.matFromImageData(imageData)
+            const result = await runDocumentScanPipelineFromRgbaMat(cv, src, jpegQuality ?? 0.92)
+            self.postMessage({ id, result })
+          } catch (err) {
+            try {
+              if (bmp) bmp.close()
+            } catch {
+              /* ignore */
+            }
+            self.postMessage({ id, result: null, error: String(err?.message || err) })
+          }
+          continue
+        }
+
         const result = await runDocumentScanPipeline(
           cv,
           dataUrl,

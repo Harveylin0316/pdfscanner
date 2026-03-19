@@ -2,7 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { jsPDF } from 'jspdf'
 import { CropAdjustModal } from '../components/CropAdjustModal.jsx'
 import { convertHeicToJpegDataUrl } from '../lib/heicConvert.js'
-import { applyOpenCvDocumentScan, warmUpOpenCv } from '../lib/documentScanOpenCv.js'
+import {
+  applyOpenCvDocumentScan,
+  applyOpenCvDocumentScanFromBitmap,
+  warmUpOpenCv,
+} from '../lib/documentScanOpenCv.js'
+import { createScaledScanBitmap } from '../lib/scanBitmapInput.js'
 import { autoCropByCornerBackground, enhanceDocumentScanAggressive } from '../lib/scanPreprocess.js'
 import '../App.css'
 
@@ -35,8 +40,8 @@ const PDF_IMAGE_COMPRESSION = {
 const SCAN_PIPELINE_MIN_LONG_EDGE = 1800
 /** 約 300dpi A4 長邊量級，與下方表單「圖片長邊上限」上限一致 */
 const SCAN_PIPELINE_CAP_LONG_EDGE = 4000
-/** 送進 OpenCV 前仍用高品質，利於邊緣／透視；列表預覽可另壓縮 */
-const SCAN_PIPELINE_PREJPEG_QUALITY = 'high'
+/** 僅備援路徑（無 ImageBitmap 時）送 JPEG；快路徑已用 bitmap 免此步 */
+const SCAN_PIPELINE_PREJPEG_QUALITY = 'medium'
 /** PDF 內嵌圖片長邊上限（從掃描原圖 baseSrc 取樣，宜與管線上限一致） */
 const PDF_EXPORT_MAX_LONG_EDGE = 4000
 
@@ -207,29 +212,17 @@ function ToolPage() {
     [maxImageEdge],
   )
 
-  /** 匯入／拍照解碼完成 → 高解析度進掃描 → 再決定列表存檔與後續 PDF */
-  const applyScanPipeline = async (dataUrl, knownDecodeWH = null) => {
+  /** OpenCV 偵測不到紙張時：主執行緒簡易裁切＋加強（不重複跑 WASM，因快路徑像素相同） */
+  const runCanvasFallbackPipeline = async (dataUrl) => {
     const qHigh = JPEG_QUALITY_PRESETS.high
-    let url = dataUrl
     try {
-      await yieldToUi()
-      const openCvUrl = await applyOpenCvDocumentScan(
-        dataUrl,
-        qHigh,
-        scanPipelineInputLongEdge,
-        knownDecodeWH,
-      )
-      if (openCvUrl) {
-        await yieldToUi()
-        return openCvUrl
-      }
-      url = await autoCropByCornerBackground(dataUrl, qHigh)
+      let url = await autoCropByCornerBackground(dataUrl, qHigh)
       await yieldToUi()
       url = await enhanceDocumentScanAggressive(url, qHigh)
+      return url
     } catch {
       return dataUrl
     }
-    return url
   }
 
   const finalizeImageForList = async (pipelineDataUrl) => {
@@ -268,16 +261,6 @@ function ToolPage() {
     },
     [cropTargetId, scanPipelineInputLongEdge, imageCompressionQuality],
   )
-
-  const normalizeUploadFileToDataUrl = async (file) => {
-    if (isHeicFile(file)) {
-      return convertHeicToJpegDataUrl(file, maxImageEdge)
-    }
-    if (isLikelyImageFile(file)) {
-      return readFileAsDataUrl(file)
-    }
-    throw new Error(`不支援的檔案格式：${file.name}`)
-  }
 
   const getSafeFileName = (value) => {
     const normalized = value.trim().replace(/[\\/:*?"<>|]+/g, '-')
@@ -329,22 +312,51 @@ function ToolPage() {
         })
 
         try {
-          const normalizedDataUrl = await normalizeUploadFileToDataUrl(file)
-          await yieldToUi()
-          const {
-            dataUrl: scanReadyUrl,
-            width: scanW,
-            height: scanH,
-          } = await compressImageWithDimensions(
-            normalizedDataUrl,
-            scanPipelineInputLongEdge,
-            SCAN_PIPELINE_PREJPEG_QUALITY,
-          )
-          await yieldToUi()
-          const pipelineUrl = await applyScanPipeline(scanReadyUrl, {
-            width: scanW,
-            height: scanH,
-          })
+          if (!isHeicFile(file) && !isLikelyImageFile(file)) {
+            throw new Error(`不支援的檔案格式：${file.name}`)
+          }
+          const edge = scanPipelineInputLongEdge
+          const qHigh = JPEG_QUALITY_PRESETS.high
+          const heic = isHeicFile(file)
+          let pipelineUrl = null
+          let heicJpegDataUrl = null
+          let pendingBitmap = null
+
+          try {
+            const source = heic
+              ? (heicJpegDataUrl = await convertHeicToJpegDataUrl(file, maxImageEdge))
+              : file
+            await yieldToUi()
+            const { bitmap } = await createScaledScanBitmap(source, edge)
+            pendingBitmap = bitmap
+            await yieldToUi()
+            pipelineUrl = await applyOpenCvDocumentScanFromBitmap(bitmap, qHigh)
+            pendingBitmap = null
+          } catch {
+            if (pendingBitmap) {
+              try {
+                pendingBitmap.close()
+              } catch {
+                /* ignore */
+              }
+              pendingBitmap = null
+            }
+          }
+
+          if (!pipelineUrl) {
+            const raw =
+              heicJpegDataUrl ??
+              (heic ? await convertHeicToJpegDataUrl(file, maxImageEdge) : await readFileAsDataUrl(file))
+            await yieldToUi()
+            const { dataUrl: ready } = await compressImageWithDimensions(
+              raw,
+              edge,
+              SCAN_PIPELINE_PREJPEG_QUALITY,
+            )
+            await yieldToUi()
+            pipelineUrl = await runCanvasFallbackPipeline(ready)
+          }
+
           await yieldToUi()
           const storedUrl = await finalizeImageForList(pipelineUrl)
           const name = getFileBaseName(file.name) || `upload-${index + 1}`
@@ -416,21 +428,39 @@ function ToolPage() {
 
     try {
       const dataUrl = canvas.toDataURL('image/jpeg', 0.95)
+      const edge = scanPipelineInputLongEdge
+      const qHigh = JPEG_QUALITY_PRESETS.high
       await yieldToUi()
-      const {
-        dataUrl: scanReadyUrl,
-        width: scanW,
-        height: scanH,
-      } = await compressImageWithDimensions(
-        dataUrl,
-        scanPipelineInputLongEdge,
-        SCAN_PIPELINE_PREJPEG_QUALITY,
-      )
-      await yieldToUi()
-      const pipelineUrl = await applyScanPipeline(scanReadyUrl, {
-        width: scanW,
-        height: scanH,
-      })
+
+      let pipelineUrl = null
+      let pendingBitmap = null
+      try {
+        const { bitmap } = await createScaledScanBitmap(dataUrl, edge)
+        pendingBitmap = bitmap
+        await yieldToUi()
+        pipelineUrl = await applyOpenCvDocumentScanFromBitmap(bitmap, qHigh)
+        pendingBitmap = null
+      } catch {
+        if (pendingBitmap) {
+          try {
+            pendingBitmap.close()
+          } catch {
+            /* ignore */
+          }
+          pendingBitmap = null
+        }
+      }
+
+      if (!pipelineUrl) {
+        const { dataUrl: ready } = await compressImageWithDimensions(
+          dataUrl,
+          edge,
+          SCAN_PIPELINE_PREJPEG_QUALITY,
+        )
+        await yieldToUi()
+        pipelineUrl = await runCanvasFallbackPipeline(ready)
+      }
+
       await yieldToUi()
       const storedUrl = await finalizeImageForList(pipelineUrl)
       setImages((prev) => [
@@ -731,10 +761,10 @@ function ToolPage() {
           </label>
         </div>
         <p className="import-pipeline-hint">
-          匯入後會以較高解析度（長邊約 {SCAN_PIPELINE_MIN_LONG_EDGE}～
-          {SCAN_PIPELINE_CAP_LONG_EDGE}px、高品質 JPEG）做紙張偵測、透視與色階；列表預覽可依「圖片壓縮品質」縮小，但
-          <strong>輸出 PDF 一律以掃描原圖</strong>（長邊上限 {PDF_EXPORT_MAX_LONG_EDGE}
-          px）再依「PDF 品質」嵌入，較接近掃描器列印效果。每張可點「調整裁切」微調。
+          匯入時優先以 <strong>ImageBitmap</strong> 直送掃描（略過整檔 base64 與進 Worker 前多一次
+          JPEG 解碼），失敗時才改讀檔備援。掃描長邊約 {SCAN_PIPELINE_MIN_LONG_EDGE}～
+          {SCAN_PIPELINE_CAP_LONG_EDGE}px；列表預覽依「圖片壓縮品質」，而
+          <strong>輸出 PDF 以掃描原圖</strong>（長邊上限 {PDF_EXPORT_MAX_LONG_EDGE}px）嵌入。
         </p>
 
         <div className="toolbar">

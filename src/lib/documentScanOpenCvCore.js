@@ -527,25 +527,15 @@ function scannerLookLab(cv, srcRgba) {
 const MAX_WARP_EDGE = 4500
 const MAX_WARP_PIXELS = 14_000_000
 
-/** @returns {Promise<string|null>} */
-export async function runDocumentScanPipeline(
-  cv,
-  dataUrl,
-  jpegQuality = 0.92,
-  maxDecodeLongEdge = 2000,
-  knownDecodeWH = null,
-) {
-  let src = null
+/**
+ * 已由 RGBA 像素建立的 src Mat（CV_8UC4）；此函式會負責 delete(src)。
+ * @returns {Promise<string|null>}
+ */
+export async function runDocumentScanPipelineFromRgbaMat(cv, src, jpegQuality = 0.92) {
   const small = new cv.Mat()
   const gray = new cv.Mat()
 
   try {
-    try {
-      src = await decodeDataUrlToSrcMat(cv, dataUrl, maxDecodeLongEdge, knownDecodeWH)
-    } catch {
-      return null
-    }
-
     const w = src.cols
     const h = src.rows
 
@@ -596,8 +586,25 @@ export async function runDocumentScanPipeline(
   } catch {
     return null
   } finally {
-    if (src) src.delete()
+    src.delete()
     small.delete()
     gray.delete()
   }
+}
+
+/** @returns {Promise<string|null>} */
+export async function runDocumentScanPipeline(
+  cv,
+  dataUrl,
+  jpegQuality = 0.92,
+  maxDecodeLongEdge = 2000,
+  knownDecodeWH = null,
+) {
+  let src = null
+  try {
+    src = await decodeDataUrlToSrcMat(cv, dataUrl, maxDecodeLongEdge, knownDecodeWH)
+  } catch {
+    return null
+  }
+  return runDocumentScanPipelineFromRgbaMat(cv, src, jpegQuality)
 }

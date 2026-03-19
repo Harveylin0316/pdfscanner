@@ -122,3 +122,50 @@ export function applyOpenCvDocumentScan(
     }
   })
 }
+
+/**
+ * 將已縮放之 ImageBitmap 交給 Worker（transfer），略過 data URL → fetch → 再 JPEG 解碼。
+ * 失敗時會關閉 bitmap；成功時由 Worker 關閉。
+ * @param {ImageBitmap} bitmap
+ * @param {number} [jpegQuality]
+ * @returns {Promise<string|null>}
+ */
+export function applyOpenCvDocumentScanFromBitmap(bitmap, jpegQuality = 0.92) {
+  const w = getWorker()
+  if (!bitmap) {
+    return Promise.resolve(null)
+  }
+  if (!w) {
+    try {
+      bitmap.close()
+    } catch {
+      /* ignore */
+    }
+    return Promise.resolve(null)
+  }
+
+  return new Promise((resolve) => {
+    const id = jobSeq++
+    const timer = setTimeout(() => {
+      if (pending.has(id)) {
+        pending.delete(id)
+        // bitmap 已 transfer 至 Worker，主執行緒不可再 close
+        resolve(null)
+      }
+    }, WORKER_JOB_TIMEOUT_MS)
+
+    pending.set(id, { resolve, timer })
+    try {
+      w.postMessage({ id, bitmap, jpegQuality }, [bitmap])
+    } catch {
+      clearTimeout(timer)
+      pending.delete(id)
+      try {
+        bitmap.close()
+      } catch {
+        /* ignore */
+      }
+      resolve(null)
+    }
+  })
+}
