@@ -51,7 +51,8 @@ export async function enhanceDocumentScanAggressive(dataUrl, quality = 0.92, max
   temp.width = width
   temp.height = height
   const tctx = temp.getContext('2d')
-  tctx.filter = 'contrast(1.26) brightness(1.07) saturate(0.78)'
+  /** 接近掃描器：對比略強、紙偏白、彩度收斂 */
+  tctx.filter = 'contrast(1.34) brightness(1.09) saturate(0.7)'
   tctx.drawImage(canvas, 0, 0)
   tctx.filter = 'none'
   return canvasToJpegDataUrl(temp, quality)

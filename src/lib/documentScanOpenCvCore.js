@@ -458,9 +458,9 @@ function polishRgbaMatLuminance(mat) {
   }
   if (samples.length < 20) return
   samples.sort((a, b) => a - b)
-  const lo = samples[Math.max(0, Math.floor(samples.length * 0.05))] ?? 0
-  const hi = samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.985))] ?? 255
-  const range = Math.max(22, hi - lo)
+  const lo = samples[Math.max(0, Math.floor(samples.length * 0.035))] ?? 0
+  const hi = samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.992))] ?? 255
+  const range = Math.max(18, hi - lo)
   const mul = 255 / range
 
   for (let j = 0; j < n; j += 1) {
@@ -491,7 +491,8 @@ function scannerLookLab(cv, srcRgba) {
   const A = mv.get(1)
   const Bch = mv.get(2)
 
-  const clahe = cv.createCLAHE(3.2, new cv.Size(10, 10))
+  /** 略增對比、較小 tile → 接近事務機／掃描器紙張質感 */
+  const clahe = cv.createCLAHE(3.55, new cv.Size(8, 8))
   const L2 = new cv.Mat()
   clahe.apply(L, L2)
   clahe.delete()
@@ -526,6 +527,53 @@ function scannerLookLab(cv, srcRgba) {
 
 const MAX_WARP_EDGE = 4500
 const MAX_WARP_PIXELS = 14_000_000
+
+/**
+ * 透視校正後裁掉多餘白邊（背景與文件對比），讓輸出更接近掃描範圍。
+ * @returns {object | null} 新 cv.Mat；失敗回 null
+ */
+function tryTrimWhiteMargins(cv, mat) {
+  const gray = new cv.Mat()
+  const mask = new cv.Mat()
+  let kernel = null
+  try {
+    kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3))
+    cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY)
+    cv.threshold(gray, mask, 246, 255, cv.THRESH_BINARY_INV)
+    cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel)
+
+    const rect = cv.boundingRect(mask)
+    if (rect.width < 24 || rect.height < 24) return null
+
+    const ratio = (rect.width * rect.height) / (mat.cols * mat.rows)
+    if (ratio > 0.985 || ratio < 0.12) return null
+
+    const pad = Math.max(4, Math.round(Math.min(mat.cols, mat.rows) * 0.012))
+    const x = Math.max(0, rect.x - pad)
+    const y = Math.max(0, rect.y - pad)
+    const rw = Math.min(mat.cols - x, rect.width + 2 * pad)
+    const rh = Math.min(mat.rows - y, rect.height + 2 * pad)
+    if (rw < 32 || rh < 32) return null
+
+    const r = new cv.Rect(x, y, rw, rh)
+    const roi = mat.roi(r)
+    const out = roi.clone()
+    roi.delete()
+    return out
+  } catch {
+    return null
+  } finally {
+    gray.delete()
+    mask.delete()
+    if (kernel) {
+      try {
+        kernel.delete()
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
 
 /**
  * 已由 RGBA 像素建立的 src Mat（CV_8UC4）；此函式會負責 delete(src)。
@@ -573,8 +621,15 @@ export async function runDocumentScanPipelineFromRgbaMat(cv, src, jpegQuality = 
       new cv.Scalar(255, 255, 255, 255),
     )
 
-    const enhanced = scannerLookLab(cv, warped)
-    warped.delete()
+    let docMat = warped
+    const trimmed = tryTrimWhiteMargins(cv, warped)
+    if (trimmed) {
+      warped.delete()
+      docMat = trimmed
+    }
+
+    const enhanced = scannerLookLab(cv, docMat)
+    docMat.delete()
     srcTri.delete()
     dstTri.delete()
     M.delete()

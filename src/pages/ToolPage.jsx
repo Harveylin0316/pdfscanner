@@ -59,6 +59,7 @@ const COMMON_IMAGE_EXTENSIONS = new Set([
   'jfif',
   'pjpeg',
   'pjp',
+  'heif',
 ])
 
 function ToolPage() {
@@ -245,10 +246,11 @@ function ToolPage() {
   /** OpenCV 偵測不到紙張時：主執行緒簡易裁切＋加強（不重複跑 WASM，因快路徑像素相同） */
   const runCanvasFallbackPipeline = async (dataUrl) => {
     const qHigh = JPEG_QUALITY_PRESETS.high
+    const me = Math.min(3600, scanPipelineInputLongEdge)
     try {
       let url = await autoCropByCornerBackground(dataUrl, qHigh)
       await yieldToUi()
-      url = await enhanceDocumentScanAggressive(url, qHigh)
+      url = await enhanceDocumentScanAggressive(url, qHigh, me)
       return url
     } catch {
       return dataUrl
@@ -357,7 +359,8 @@ function ToolPage() {
               ? (heicJpegDataUrl = await convertHeicToJpegDataUrl(file, maxImageEdge))
               : file
             await yieldToUi()
-            const { bitmap } = await createScaledScanBitmap(source, edge)
+            const mimeForDecode = heic ? 'image/jpeg' : file.type || ''
+            const { bitmap } = await createScaledScanBitmap(source, edge, mimeForDecode)
             pendingBitmap = bitmap
             await yieldToUi()
             pipelineUrl = await applyOpenCvDocumentScanFromBitmap(bitmap, qHigh)
@@ -468,7 +471,7 @@ function ToolPage() {
       let pipelineUrl = null
       let pendingBitmap = null
       try {
-        const { bitmap } = await createScaledScanBitmap(dataUrl, edge)
+        const { bitmap } = await createScaledScanBitmap(dataUrl, edge, 'image/jpeg')
         pendingBitmap = bitmap
         await yieldToUi()
         pipelineUrl = await applyOpenCvDocumentScanFromBitmap(bitmap, qHigh)
@@ -801,10 +804,10 @@ function ToolPage() {
           </label>
         </div>
         <p className="import-pipeline-hint">
-          匯入時優先以 <strong>ImageBitmap</strong> 直送掃描（略過整檔 base64 與進 Worker 前多一次
-          JPEG 解碼），失敗時才改讀檔備援。掃描長邊約 {SCAN_PIPELINE_MIN_LONG_EDGE}～
-          {SCAN_PIPELINE_CAP_LONG_EDGE}px；列表預覽依「圖片壓縮品質」，而
-          <strong>輸出 PDF 以掃描原圖</strong>（長邊上限 {PDF_EXPORT_MAX_LONG_EDGE}px）嵌入。
+          支援 PNG／JPEG／WebP／AVIF／GIF／BMP 等：優先<strong>檔頭讀尺寸</strong>或
+          <strong>ImageDecoder</strong> 直接縮圖再掃描，大檔也較快。掃描含<strong>自動透視、白邊裁切、紙張色階</strong>
+          （接近事務機掃描）；長邊約 {SCAN_PIPELINE_MIN_LONG_EDGE}～{SCAN_PIPELINE_CAP_LONG_EDGE}px。列表預覽依「圖片壓縮品質」，
+          <strong>PDF 以掃描原圖</strong>（長邊上限 {PDF_EXPORT_MAX_LONG_EDGE}px）嵌入。
         </p>
 
         <div className="toolbar">
