@@ -419,7 +419,7 @@ function scannerLookLab(cv, srcRgba) {
   const A = mv.get(1)
   const Bch = mv.get(2)
 
-  const clahe = cv.createCLAHE(2.8, new cv.Size(8, 8))
+  const clahe = cv.createCLAHE(3.2, new cv.Size(10, 10))
   const L2 = new cv.Mat()
   clahe.apply(L, L2)
   clahe.delete()

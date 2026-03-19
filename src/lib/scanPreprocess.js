@@ -42,6 +42,77 @@ export async function enhanceDocumentScan(dataUrl, quality = 0.92) {
   return canvasToJpegDataUrl(temp, quality)
 }
 
+/**
+ * OpenCV 失敗時：較強的「掃描感」濾鏡（淨白紙張、字更黑）。
+ */
+export async function enhanceDocumentScanAggressive(dataUrl, quality = 0.92) {
+  const { canvas, width, height } = await loadImageToCanvas(dataUrl)
+  const temp = document.createElement('canvas')
+  temp.width = width
+  temp.height = height
+  const tctx = temp.getContext('2d')
+  tctx.filter = 'contrast(1.26) brightness(1.07) saturate(0.78)'
+  tctx.drawImage(canvas, 0, 0)
+  tctx.filter = 'none'
+  return canvasToJpegDataUrl(temp, quality)
+}
+
+/**
+ * 透視校正後：依亮度分位數拉開階調，紙張趨白、字趨黑（主執行緒、輕量）。
+ */
+export async function polishScannedDocument(dataUrl, quality = 0.93) {
+  const img = await loadImageNatural(dataUrl)
+  const natW = img.naturalWidth
+  const natH = img.naturalHeight
+  if (!natW || !natH) return dataUrl
+
+  const maxEdge = 2600
+  const scale = Math.max(natW, natH) > maxEdge ? maxEdge / Math.max(natW, natH) : 1
+  const w = Math.max(1, Math.round(natW * scale))
+  const h = Math.max(1, Math.round(natH * scale))
+
+  const canvas = document.createElement('canvas')
+  canvas.width = w
+  canvas.height = h
+  const ctx = canvas.getContext('2d')
+  ctx.drawImage(img, 0, 0, w, h)
+
+  const imageData = ctx.getImageData(0, 0, w, h)
+  const { data } = imageData
+  const total = w * h
+  const sampleStep = Math.max(1, Math.ceil(total / 80000))
+  const samples = []
+  for (let j = 0; j < total; j += sampleStep) {
+    const i = j * 4
+    samples.push(data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114)
+  }
+  samples.sort((a, b) => a - b)
+  const lo = samples[Math.max(0, Math.floor(samples.length * 0.05))] ?? 0
+  const hi = samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.985))] ?? 255
+  const range = Math.max(22, hi - lo)
+  const mul = 255 / range
+
+  for (let i = 0; i < data.length; i += 4) {
+    const y = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114
+    const y2 = Math.min(255, Math.max(0, (y - lo) * mul))
+    const k = y > 2 ? y2 / y : 1
+    data[i] = Math.min(255, Math.round(data[i] * k))
+    data[i + 1] = Math.min(255, Math.round(data[i + 1] * k))
+    data[i + 2] = Math.min(255, Math.round(data[i + 2] * k))
+  }
+
+  ctx.putImageData(imageData, 0, 0)
+
+  const out = document.createElement('canvas')
+  out.width = natW
+  out.height = natH
+  const octx = out.getContext('2d')
+  octx.filter = 'contrast(1.05) brightness(1.02)'
+  octx.drawImage(canvas, 0, 0, w, h, 0, 0, natW, natH)
+  octx.filter = 'none'
+  return canvasToJpegDataUrl(out, quality)
+}
+
 function loadImageNatural(dataUrl) {
   return new Promise((resolve, reject) => {
     const img = new Image()

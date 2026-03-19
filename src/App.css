@@ -177,6 +177,14 @@ label.button input {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.import-pipeline-hint {
+  margin: 10px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #64748b;
+  text-align: left;
+}
+
 .error {
   margin: 10px 0 0;
   color: #b91c1c;
