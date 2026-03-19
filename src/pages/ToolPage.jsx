@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { jsPDF } from 'jspdf'
+import { CropAdjustModal } from '../components/CropAdjustModal.jsx'
 import { convertHeicToJpegDataUrl } from '../lib/heicConvert.js'
 import { applyOpenCvDocumentScan, warmUpOpenCv } from '../lib/documentScanOpenCv.js'
 import {
@@ -70,6 +71,7 @@ function ToolPage() {
   const [pdfFileName, setPdfFileName] = useState('scanned-document')
   const [maxImageEdge, setMaxImageEdge] = useState(2000)
   const [imageCompressionQuality, setImageCompressionQuality] = useState('medium')
+  const [cropTargetId, setCropTargetId] = useState(null)
   const videoRef = useRef(null)
   const streamRef = useRef(null)
   const uploadSingleInputRef = useRef(null)
@@ -148,6 +150,8 @@ function ToolPage() {
   const toImageItem = (source, fileName = 'photo') => ({
     id: crypto.randomUUID(),
     src: source,
+    /** 掃描後原圖；手動裁切永遠由此裁，避免重複 JPEG 損失 */
+    baseSrc: source,
     name: `${fileName}.jpg`,
   })
 
@@ -213,6 +217,27 @@ function ToolPage() {
       JPEG_QUALITY_PRESETS[imageCompressionQuality] || JPEG_QUALITY_PRESETS.medium
     return compressImage(pipelineDataUrl, scanPipelineInputLongEdge, q)
   }
+
+  const cropModalUrl = useMemo(() => {
+    const im = images.find((item) => item.id === cropTargetId)
+    return im?.baseSrc ?? im?.src ?? null
+  }, [images, cropTargetId])
+
+  const handleCropApplyFromModal = useCallback(
+    async (dataUrl) => {
+      const id = cropTargetId
+      if (!id) return
+      const compressed = await compressImage(
+        dataUrl,
+        scanPipelineInputLongEdge,
+        imageCompressionQuality,
+      )
+      setImages((prev) =>
+        prev.map((im) => (im.id === id ? { ...im, src: compressed } : im)),
+      )
+    },
+    [cropTargetId, scanPipelineInputLongEdge, imageCompressionQuality],
+  )
 
   const normalizeUploadFileToDataUrl = async (file) => {
     if (isHeicFile(file)) {
@@ -452,6 +477,12 @@ function ToolPage() {
 
   return (
     <main className="app">
+      <CropAdjustModal
+        isOpen={cropTargetId !== null}
+        imageUrl={cropModalUrl}
+        onClose={() => setCropTargetId(null)}
+        onApply={handleCropApplyFromModal}
+      />
       <header className="header">
         <h1>照片轉 PDF</h1>
         <p>上傳或拍照後，調整順序與輸出設定，一鍵匯出 PDF。</p>
@@ -644,8 +675,8 @@ function ToolPage() {
         </div>
         <p className="import-pipeline-hint">
           匯入完成後會先以較高解析度（長邊約 {SCAN_PIPELINE_MIN_LONG_EDGE}～
-          {SCAN_PIPELINE_CAP_LONG_EDGE}px、高品質 JPEG）做紙張偵測、透視與色階，再依上方「圖片壓縮品質」存成列表預覽。輸出
-          PDF 時另依「PDF 品質」嵌入（長邊上限 {PDF_EXPORT_MAX_LONG_EDGE}px）。
+          {SCAN_PIPELINE_CAP_LONG_EDGE}px、高品質 JPEG）做紙張偵測、透視與色階，再依上方「圖片壓縮品質」存成列表預覽。每張可點「調整裁切」以
+          3×3 格線微調範圍（選用）。輸出 PDF 時另依「PDF 品質」嵌入（長邊上限 {PDF_EXPORT_MAX_LONG_EDGE}px）。
         </p>
 
         <div className="toolbar">
@@ -688,6 +719,13 @@ function ToolPage() {
                   <span>第 {index + 1} 頁</span>
                 </div>
                 <div className="actions">
+                  <button
+                    type="button"
+                    className="button secondary"
+                    onClick={() => setCropTargetId(image.id)}
+                  >
+                    調整裁切
+                  </button>
                   <button type="button" className="button ghost" onClick={() => moveImage(index, -1)}>
                     上移
                   </button>
