@@ -32,8 +32,10 @@ const PDF_IMAGE_COMPRESSION = {
   low: 'FAST',
 }
 
-/** 掃描管線長邊下限（過高會拖慢匯入；與 OpenCV Worker 解碼上限需一致） */
-const SCAN_PIPELINE_MIN_LONG_EDGE = 1800
+/** 掃描管線長邊下限（可調低以換取速度；與 OpenCV Worker 解碼上限需一致） */
+const SCAN_PIPELINE_MIN_LONG_EDGE = 1600
+/** 送進 OpenCV Worker 的 bitmap 長邊硬上限（主執行緒 getImageData + WASM 與此成正比） */
+const OPEN_CV_PIPELINE_BITMAP_MAX_LONG_EDGE = 2600
 /** 約 300dpi A4 長邊量級，與下方表單「圖片長邊上限」上限一致 */
 const SCAN_PIPELINE_CAP_LONG_EDGE = 4000
 /** 僅備援路徑（無 ImageBitmap 時）送 JPEG；快路徑已用 bitmap 免此步 */
@@ -306,7 +308,7 @@ function ToolPage() {
    */
   const runScanPipelineOnCroppedDataUrl = useCallback(
     async (croppedDataUrl) => {
-      const edge = scanPipelineInputLongEdge
+      const edge = Math.min(scanPipelineInputLongEdge, OPEN_CV_PIPELINE_BITMAP_MAX_LONG_EDGE)
       const qHigh = JPEG_QUALITY_PRESETS.high
       let pipelineUrl = null
       let pendingBitmap = null
@@ -924,7 +926,8 @@ function ToolPage() {
         </div>
         <p className="import-pipeline-hint">
           <strong>流程：</strong>選圖或拍照後會先開<strong>裁切視窗</strong>，確認範圍並按「套用並掃描」才會做透視與掃描色階；略過則不加入列表。
-          支援常見圖檔與 HEIC；掃描長邊約 {SCAN_PIPELINE_MIN_LONG_EDGE}～{SCAN_PIPELINE_CAP_LONG_EDGE}px。列表預覽依「圖片壓縮品質」，
+          支援常見圖檔與 HEIC；OpenCV 處理用 bitmap 長邊至多約 {OPEN_CV_PIPELINE_BITMAP_MAX_LONG_EDGE}px（較快），表單「圖片長邊上限」仍影響列表壓縮。可調範圍約{' '}
+          {SCAN_PIPELINE_MIN_LONG_EDGE}～{SCAN_PIPELINE_CAP_LONG_EDGE}px。列表預覽依「圖片壓縮品質」，
           <strong>PDF／匯出圖片以掃描結果</strong>為主（PDF 嵌入長邊上限 {PDF_EXPORT_MAX_LONG_EDGE}px）。
         </p>
 

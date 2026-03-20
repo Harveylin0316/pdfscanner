@@ -433,6 +433,9 @@ function detectDocumentQuad(cv, gray, dw, dh, ds) {
   return pickBestQuad(candidates, imgAreaFull)
 }
 
+/** 超過此像素數跳過 luminance polish（全圖逐像素成本高；CLAHE 已拉對比） */
+const POLISH_MAX_PIXELS = 2_800_000
+
 /**
  * 亮度分位數拉開（與主程式 polish 同概念），在 Worker 內改像素，避免主執行緒大圖 decode/upscale 卡死。
  * 僅處理連續 CV_8UC4（scannerLookLab 輸出通常為連續）。
@@ -448,9 +451,12 @@ function polishRgbaMatLuminance(mat) {
   const cols = mat.cols
   if (rows < 4 || cols < 4) return
 
-  const bytes = mat.data
   const n = rows * cols
-  const sampleStep = Math.max(1, Math.ceil(n / 80000))
+  if (n > POLISH_MAX_PIXELS) return
+
+  const bytes = mat.data
+  /** 取樣略減可省排序時間，對大圖影響極小 */
+  const sampleStep = Math.max(1, Math.ceil(n / 100_000))
   const samples = []
   for (let j = 0; j < n; j += sampleStep) {
     const i = j * 4
@@ -491,8 +497,8 @@ function scannerLookLab(cv, srcRgba) {
   const A = mv.get(1)
   const Bch = mv.get(2)
 
-  /** 略增對比、較小 tile → 接近事務機／掃描器紙張質感 */
-  const clahe = cv.createCLAHE(3.55, new cv.Size(8, 8))
+  /** 較大 tile 減少分塊運算量，速度明顯優於 8×8，畫質仍接近掃描感 */
+  const clahe = cv.createCLAHE(3.35, new cv.Size(12, 12))
   const L2 = new cv.Mat()
   clahe.apply(L, L2)
   clahe.delete()
@@ -527,6 +533,12 @@ function scannerLookLab(cv, srcRgba) {
 
 const MAX_WARP_EDGE = 4500
 const MAX_WARP_PIXELS = 14_000_000
+
+/**
+ * 透視／CLAHE 前將工作圖縮到此長邊以下（偵測仍用原圖推算的四角座標再換算）。
+ * 對 3～4K 輸入可省大量 WASM 時間，畫質多數文件仍足夠。
+ */
+const WARP_WORK_MAX_LONG_EDGE = 2200
 
 /**
  * 透視校正後裁掉多餘白邊（背景與文件對比），讓輸出更接近掃描範圍。
@@ -582,6 +594,7 @@ function tryTrimWhiteMargins(cv, mat) {
 export async function runDocumentScanPipelineFromRgbaMat(cv, src, jpegQuality = 0.92) {
   const small = new cv.Mat()
   const gray = new cv.Mat()
+  let workMat = src
 
   try {
     const w = src.cols
@@ -595,9 +608,27 @@ export async function runDocumentScanPipelineFromRgbaMat(cv, src, jpegQuality = 
     cv.resize(src, small, new cv.Size(dw, dh), 0, 0, cv.INTER_AREA)
     cv.cvtColor(small, gray, cv.COLOR_RGBA2GRAY, 0)
 
-    const ordered = detectDocumentQuad(cv, gray, dw, dh, ds)
+    let ordered = detectDocumentQuad(cv, gray, dw, dh, ds)
     if (!ordered) {
       return null
+    }
+
+    const longIn = Math.max(w, h)
+    if (longIn > WARP_WORK_MAX_LONG_EDGE) {
+      const sw = WARP_WORK_MAX_LONG_EDGE / longIn
+      const w2 = Math.max(1, Math.round(w * sw))
+      const h2 = Math.max(1, Math.round(h * sw))
+      const down = new cv.Mat()
+      cv.resize(workMat, down, new cv.Size(w2, h2), 0, 0, cv.INTER_AREA)
+      try {
+        workMat.delete()
+      } catch {
+        /* ignore */
+      }
+      workMat = down
+      const sx = w2 / w
+      const sy = h2 / h
+      ordered = ordered.map((p) => ({ x: p.x * sx, y: p.y * sy }))
     }
 
     const [maxW, maxH] = quadWidthHeight(ordered)
@@ -612,7 +643,7 @@ export async function runDocumentScanPipelineFromRgbaMat(cv, src, jpegQuality = 
     const M = cv.getPerspectiveTransform(srcTri, dstTri)
     const warped = new cv.Mat()
     cv.warpPerspective(
-      src,
+      workMat,
       warped,
       M,
       new cv.Size(maxW, maxH),
@@ -641,7 +672,11 @@ export async function runDocumentScanPipelineFromRgbaMat(cv, src, jpegQuality = 
   } catch {
     return null
   } finally {
-    src.delete()
+    try {
+      workMat.delete()
+    } catch {
+      /* ignore */
+    }
     small.delete()
     gray.delete()
   }
