@@ -1,7 +1,9 @@
 /**
  * 匯入效能：多路徑降採樣後再送 OpenCV Worker。
- * 注意：部分瀏覽器對 PNG／GIF 使用 createImageBitmap(blob, { resizeWidth, resizeHeight })
- * 會長時間阻塞主執行緒（看似當機），故這類格式改走 ImageDecoder 或「全解碼 + canvas 縮圖」。
+ * PNG／GIF：
+ * - 勿用 createImageBitmap(blob, { resizeWidth, resizeHeight })（易阻塞主執行緒）
+ * - 勿用 ImageDecoder(blob.stream())（Safari／部分 Chromium 對 PNG 會卡在 completed／decode，進度條假滿）
+ * → 僅用「createImageBitmap(blob) 全解碼 + canvas／OffscreenCanvas 縮圖」。
  */
 
 import {
@@ -104,10 +106,8 @@ function mimeFromDataUrl(dataUrl) {
   return m ? m[1].trim() : ''
 }
 
-/**
- * PNG／GIF：避免 createImageBitmap(blob, resize*) 造成主執行緒假死（Chromium / WebKit 已知行為差異大）。
- */
-function shouldSkipBitmapDecodeResize(mime) {
+/** PNG／GIF：走穩定路徑，略過 decode-resize 與 ImageDecoder */
+function isPngOrGifMime(mime) {
   const m = (mime || '').toLowerCase().split(';')[0].trim()
   return m === 'image/png' || m === 'image/gif'
 }
@@ -138,7 +138,7 @@ export async function createScaledScanBitmap(input, maxLongEdge, mimeHint = '') 
   }
 
   const effectiveMime = resolvedMime || (await sniffImageMimeTypeFromBlob(blob))
-  const skipDecodeResize = shouldSkipBitmapDecodeResize(effectiveMime)
+  const pngOrGif = isPngOrGifMime(effectiveMime)
 
   const probed = await probeImageDimensionsFromBlob(blob)
   let targetW = 0
@@ -154,7 +154,7 @@ export async function createScaledScanBitmap(input, maxLongEdge, mimeHint = '') 
   }
 
   /** JPEG／WebP／BMP 等：decode 時順便縮放（快） */
-  if (needsDownscale && probed && !skipDecodeResize) {
+  if (needsDownscale && probed && !pngOrGif) {
     try {
       const bitmap = await createImageBitmap(blob, {
         resizeWidth: targetW,
@@ -166,8 +166,10 @@ export async function createScaledScanBitmap(input, maxLongEdge, mimeHint = '') 
     }
   }
 
-  /** 需縮放但跳過上一段，或無法由檔頭得知尺寸：ImageDecoder（PNG／AVIF 等常較穩） */
-  if ((needsDownscale && probed) || !probed) {
+  /**
+   * AVIF／部分 WebP 等：ImageDecoder 縮放（勿用於 PNG／GIF，易永遠 await 卡住）
+   */
+  if (((needsDownscale && probed) || !probed) && !pngOrGif) {
     const dec = await tryImageDecoderScaledBitmap(blob, edge, effectiveMime)
     if (dec) return dec
   }

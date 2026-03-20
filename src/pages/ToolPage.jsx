@@ -44,6 +44,26 @@ const PDF_EXPORT_MAX_LONG_EDGE = 4000
 const IMAGE_EDGE_MIN = 800
 const IMAGE_EDGE_MAX = 4000
 
+/** 解碼／縮圖若超時則中斷，避免 UI 永遠停在「匯入中」 */
+const IMPORT_DECODE_TIMEOUT_MS = 75_000
+
+function withTimeout(promise, ms, message) {
+  let timeoutId
+  return new Promise((resolve, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(message)), ms)
+    promise.then(
+      (v) => {
+        clearTimeout(timeoutId)
+        resolve(v)
+      },
+      (e) => {
+        clearTimeout(timeoutId)
+        reject(e)
+      },
+    )
+  })
+}
+
 const COMMON_IMAGE_EXTENSIONS = new Set([
   'jpg',
   'jpeg',
@@ -360,7 +380,11 @@ function ToolPage() {
               : file
             await yieldToUi()
             const mimeForDecode = heic ? 'image/jpeg' : file.type || ''
-            const { bitmap } = await createScaledScanBitmap(source, edge, mimeForDecode)
+            const { bitmap } = await withTimeout(
+              createScaledScanBitmap(source, edge, mimeForDecode),
+              IMPORT_DECODE_TIMEOUT_MS,
+              '圖片讀取逾時。請嘗試降低「圖片長邊上限」或改較小解析度截圖後再匯入。',
+            )
             pendingBitmap = bitmap
             await yieldToUi()
             pipelineUrl = await applyOpenCvDocumentScanFromBitmap(bitmap, qHigh)
@@ -471,7 +495,11 @@ function ToolPage() {
       let pipelineUrl = null
       let pendingBitmap = null
       try {
-        const { bitmap } = await createScaledScanBitmap(dataUrl, edge, 'image/jpeg')
+        const { bitmap } = await withTimeout(
+          createScaledScanBitmap(dataUrl, edge, 'image/jpeg'),
+          IMPORT_DECODE_TIMEOUT_MS,
+          '照片處理逾時，請再試一次。',
+        )
         pendingBitmap = bitmap
         await yieldToUi()
         pipelineUrl = await applyOpenCvDocumentScanFromBitmap(bitmap, qHigh)
