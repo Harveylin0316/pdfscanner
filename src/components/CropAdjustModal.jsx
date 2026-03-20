@@ -51,13 +51,30 @@ function applyDrag(kind, startCrop, dnx, dny) {
   return clampCropNorm(next)
 }
 
+const COPY = {
+  import: {
+    title: '確認掃描範圍',
+    sub:
+      '拖曳框出要當成「一頁文件」的區域（含紙張邊緣）。套用後會對此範圍做透視與掃描色調；全圖請按「還原全圖」。',
+    apply: '套用並掃描',
+    cancel: '略過此張',
+  },
+  edit: {
+    title: '調整裁切範圍（3×3 參考格）',
+    sub: '拖曳四角或邊緣縮放；拖曳中央平移。套用後會依新範圍重新掃描。',
+    apply: '套用並重新掃描',
+    cancel: '關閉（不套用）',
+  },
+}
+
 /**
  * @param {object} props
  * @param {string|null} props.imageUrl
- * @param {() => void} props.onClose
- * @param {(dataUrl: string) => void | Promise<void>} props.onApply
+ * @param {'import'|'edit'} [props.variant]
+ * @param {() => void} props.onClose 使用者取消／略過（backdrop、Escape、略過按鈕）
+ * @param {(dataUrl: string) => void | Promise<void>} props.onApply 成功後由父層關閉 modal（更新 queue 或 cropTargetId）
  */
-export function CropAdjustModal({ imageUrl, onClose, onApply }) {
+export function CropAdjustModal({ imageUrl, onClose, onApply, variant = 'edit' }) {
   const stageRef = useRef(null)
   const imgRef = useRef(null)
   const dispRef = useRef({ x: 0, y: 0, w: 1, h: 1 })
@@ -147,6 +164,8 @@ export function CropAdjustModal({ imageUrl, onClose, onApply }) {
 
   const resetFull = () => setCrop({ x: 0, y: 0, w: 1, h: 1 })
 
+  const copy = COPY[variant] || COPY.edit
+
   const handleApply = async () => {
     if (!imageUrl) return
     setApplyError('')
@@ -154,7 +173,7 @@ export function CropAdjustModal({ imageUrl, onClose, onApply }) {
     try {
       const out = await cropDataUrlFromNormalized(imageUrl, crop, 0.93)
       await Promise.resolve(onApply(out))
-      onClose()
+      /** 成功後由父層關閉（import 佇列 slice / edit 清 cropTargetId），避免重複 onClose 與佇列錯位 */
     } catch (err) {
       setApplyError(err?.message || '裁切套用失敗，請再試一次。')
     } finally {
@@ -184,10 +203,8 @@ export function CropAdjustModal({ imageUrl, onClose, onApply }) {
         onClick={(e) => e.stopPropagation()}
       >
         <div className="crop-modal-header">
-          <h2 id="crop-modal-title">調整裁切範圍（3×3 參考格）</h2>
-          <p className="crop-modal-sub">
-            拖曳四角或邊緣縮放；拖曳中央區域平移。可不調整直接關閉，輸出 PDF 將使用目前預覽圖。
-          </p>
+          <h2 id="crop-modal-title">{copy.title}</h2>
+          <p className="crop-modal-sub">{copy.sub}</p>
         </div>
 
         <div ref={stageRef} className="crop-stage">
@@ -314,7 +331,7 @@ export function CropAdjustModal({ imageUrl, onClose, onApply }) {
             還原全圖
           </button>
           <button type="button" className="button ghost" onClick={onClose}>
-            關閉（不套用）
+            {copy.cancel}
           </button>
           <button
             type="button"
@@ -322,7 +339,7 @@ export function CropAdjustModal({ imageUrl, onClose, onApply }) {
             onClick={handleApply}
             disabled={isApplying}
           >
-            {isApplying ? '套用中…' : '套用裁切'}
+            {isApplying ? '掃描處理中…' : copy.apply}
           </button>
         </div>
       </div>

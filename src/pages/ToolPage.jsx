@@ -99,6 +99,8 @@ function ToolPage() {
   const [maxImageEdge, setMaxImageEdge] = useState(2600)
   const [imageCompressionQuality, setImageCompressionQuality] = useState('high')
   const [cropTargetId, setCropTargetId] = useState(null)
+  /** 上傳／拍照後先排隊，逐一開裁切 modal，套用後才跑掃描管線 */
+  const [importCropQueue, setImportCropQueue] = useState([])
   const videoRef = useRef(null)
   const streamRef = useRef(null)
   const uploadSingleInputRef = useRef(null)
@@ -217,14 +219,17 @@ function ToolPage() {
    * @param {string} fileName
    * @param {string | null} [fullSrc] 掃描管線輸出；PDF／裁切用，避免預覽壓縮拖累列印品質
    */
-  const toImageItem = (displaySrc, fileName = 'photo', fullSrc = null) => ({
-    id:
-      globalThis.crypto?.randomUUID?.() ??
-      `img-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
-    src: displaySrc,
-    baseSrc: fullSrc ?? displaySrc,
-    name: `${fileName}.jpg`,
-  })
+  const toImageItem = useCallback(
+    (displaySrc, fileName = 'photo', fullSrc = null) => ({
+      id:
+        globalThis.crypto?.randomUUID?.() ??
+        `img-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
+      src: displaySrc,
+      baseSrc: fullSrc ?? displaySrc,
+      name: `${fileName}.jpg`,
+    }),
+    [],
+  )
 
   const getFileBaseName = (fileName) => fileName.replace(/\.[^.]+$/, '')
 
@@ -264,18 +269,21 @@ function ToolPage() {
   )
 
   /** OpenCV 偵測不到紙張時：主執行緒簡易裁切＋加強（不重複跑 WASM，因快路徑像素相同） */
-  const runCanvasFallbackPipeline = async (dataUrl) => {
-    const qHigh = JPEG_QUALITY_PRESETS.high
-    const me = Math.min(3600, scanPipelineInputLongEdge)
-    try {
-      let url = await autoCropByCornerBackground(dataUrl, qHigh)
-      await yieldToUi()
-      url = await enhanceDocumentScanAggressive(url, qHigh, me)
-      return url
-    } catch {
-      return dataUrl
-    }
-  }
+  const runCanvasFallbackPipeline = useCallback(
+    async (dataUrl) => {
+      const qHigh = JPEG_QUALITY_PRESETS.high
+      const me = Math.min(3600, scanPipelineInputLongEdge)
+      try {
+        let url = await autoCropByCornerBackground(dataUrl, qHigh)
+        await yieldToUi()
+        url = await enhanceDocumentScanAggressive(url, qHigh, me)
+        return url
+      } catch {
+        return dataUrl
+      }
+    },
+    [scanPipelineInputLongEdge],
+  )
 
   const finalizeImageForList = useCallback(
     async (pipelineDataUrl) => {
@@ -292,33 +300,122 @@ function ToolPage() {
     [compressImage, imageCompressionQuality, loadImage, scanPipelineInputLongEdge],
   )
 
+  /**
+   * 對「使用者確認後的裁切圖」跑掃描管線（OpenCV 透視／色階等），回傳列表用 src 與 PDF 用 baseSrc。
+   * @param {string} croppedDataUrl JPEG data URL
+   */
+  const runScanPipelineOnCroppedDataUrl = useCallback(
+    async (croppedDataUrl) => {
+      const edge = scanPipelineInputLongEdge
+      const qHigh = JPEG_QUALITY_PRESETS.high
+      let pipelineUrl = null
+      let pendingBitmap = null
+      try {
+        const { bitmap } = await withTimeout(
+          createScaledScanBitmap(croppedDataUrl, edge, 'image/jpeg'),
+          IMPORT_DECODE_TIMEOUT_MS,
+          '圖片讀取逾時。請嘗試降低「圖片長邊上限」或改較小解析度截圖後再匯入。',
+        )
+        pendingBitmap = bitmap
+        await yieldToUi()
+        pipelineUrl = await applyOpenCvDocumentScanFromBitmap(bitmap, qHigh)
+        pendingBitmap = null
+      } catch {
+        if (pendingBitmap) {
+          try {
+            pendingBitmap.close()
+          } catch {
+            /* ignore */
+          }
+          pendingBitmap = null
+        }
+      }
+
+      if (!pipelineUrl) {
+        const { dataUrl: ready } = await compressImageWithDimensions(
+          croppedDataUrl,
+          edge,
+          SCAN_PIPELINE_PREJPEG_QUALITY,
+        )
+        await yieldToUi()
+        pipelineUrl = await runCanvasFallbackPipeline(ready)
+      }
+
+      await yieldToUi()
+      const storedUrl = await finalizeImageForList(pipelineUrl)
+      return { storedUrl, pipelineUrl }
+    },
+    [
+      compressImageWithDimensions,
+      finalizeImageForList,
+      runCanvasFallbackPipeline,
+      scanPipelineInputLongEdge,
+    ],
+  )
+
   const cropModalUrl = useMemo(() => {
     const im = images.find((item) => item.id === cropTargetId)
     return im?.baseSrc ?? im?.src ?? null
   }, [images, cropTargetId])
 
+  const importHead = useMemo(() => importCropQueue[0] ?? null, [importCropQueue])
+
+  const newImportQueueId = useCallback(
+    () =>
+      globalThis.crypto?.randomUUID?.() ??
+      `imp-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
+    [],
+  )
+
+  /** 匯入佇列：略過目前這張（不掃描） */
+  const handleImportSkip = useCallback((head) => {
+    if (!head) return
+    setImportCropQueue((q) => (q[0]?.id === head.id ? q.slice(1) : q))
+  }, [])
+
+  /** 匯入佇列：套用裁切後掃描並加入列表 */
+  const handleImportCropApply = useCallback(
+    async (croppedDataUrl, head) => {
+      if (!head) return
+      setIsProcessingImages(true)
+      try {
+        const { storedUrl, pipelineUrl } = await runScanPipelineOnCroppedDataUrl(croppedDataUrl)
+        setImages((prev) => [...prev, toImageItem(storedUrl, head.fileName, pipelineUrl)])
+        setImportCropQueue((q) => (q[0]?.id === head.id ? q.slice(1) : q))
+        setErrorMessage('')
+      } catch (err) {
+        setErrorMessage(err?.message || '掃描失敗，請再試。')
+        throw err
+      } finally {
+        setIsProcessingImages(false)
+      }
+    },
+    [runScanPipelineOnCroppedDataUrl, toImageItem],
+  )
+
+  /** 列表項目：重新裁切後依新範圍再跑掃描管線 */
   const handleCropApplyFromModal = useCallback(
-    async (dataUrl) => {
+    async (croppedDataUrl) => {
       const id = cropTargetId
       if (!id) return
+      setIsProcessingImages(true)
       try {
-        const compressed = await compressImage(
-          dataUrl,
-          scanPipelineInputLongEdge,
-          imageCompressionQuality,
-        )
+        const { storedUrl, pipelineUrl } = await runScanPipelineOnCroppedDataUrl(croppedDataUrl)
         setImages((prev) =>
           prev.map((im) =>
-            im.id === id ? { ...im, baseSrc: dataUrl, src: compressed } : im,
+            im.id === id ? { ...im, baseSrc: pipelineUrl, src: storedUrl } : im,
           ),
         )
         setErrorMessage('')
+        setCropTargetId(null)
       } catch (err) {
-        setErrorMessage(err?.message || '套用裁切後壓縮失敗，請再試。')
+        setErrorMessage(err?.message || '重新掃描失敗，請再試。')
         throw err
+      } finally {
+        setIsProcessingImages(false)
       }
     },
-    [compressImage, cropTargetId, imageCompressionQuality, scanPipelineInputLongEdge],
+    [cropTargetId, runScanPipelineOnCroppedDataUrl],
   )
 
   const getSafeFileName = (value) => {
@@ -367,64 +464,27 @@ function ToolPage() {
           if (!isHeicFile(file) && !isLikelyImageFile(file)) {
             throw new Error(`不支援的檔案格式：${file.name}`)
           }
-          const edge = scanPipelineInputLongEdge
-          const qHigh = JPEG_QUALITY_PRESETS.high
           const heic = isHeicFile(file)
-          let pipelineUrl = null
-          let heicJpegDataUrl = null
-          let pendingBitmap = null
-
-          try {
-            const source = heic
-              ? (heicJpegDataUrl = await convertHeicToJpegDataUrl(file, maxImageEdge))
-              : file
-            await yieldToUi()
-            const mimeForDecode = heic ? 'image/jpeg' : file.type || ''
-            const { bitmap } = await withTimeout(
-              createScaledScanBitmap(source, edge, mimeForDecode),
-              IMPORT_DECODE_TIMEOUT_MS,
-              '圖片讀取逾時。請嘗試降低「圖片長邊上限」或改較小解析度截圖後再匯入。',
-            )
-            pendingBitmap = bitmap
-            await yieldToUi()
-            pipelineUrl = await applyOpenCvDocumentScanFromBitmap(bitmap, qHigh)
-            pendingBitmap = null
-          } catch {
-            if (pendingBitmap) {
-              try {
-                pendingBitmap.close()
-              } catch {
-                /* ignore */
-              }
-              pendingBitmap = null
-            }
+          let dataUrl
+          if (heic) {
+            dataUrl = await convertHeicToJpegDataUrl(file, maxImageEdge)
+          } else {
+            dataUrl = await readFileAsDataUrl(file)
           }
-
-          if (!pipelineUrl) {
-            const raw =
-              heicJpegDataUrl ??
-              (heic ? await convertHeicToJpegDataUrl(file, maxImageEdge) : await readFileAsDataUrl(file))
-            await yieldToUi()
-            const { dataUrl: ready } = await compressImageWithDimensions(
-              raw,
-              edge,
-              SCAN_PIPELINE_PREJPEG_QUALITY,
-            )
-            await yieldToUi()
-            pipelineUrl = await runCanvasFallbackPipeline(ready)
-          }
-
           await yieldToUi()
-          const storedUrl = await finalizeImageForList(pipelineUrl)
           const name = getFileBaseName(file.name) || `upload-${index + 1}`
-          successItems.push(toImageItem(storedUrl, name, pipelineUrl))
+          successItems.push({
+            id: newImportQueueId(),
+            fileName: name,
+            dataUrl,
+          })
         } catch (error) {
           failItems.push(error)
         }
       }
 
       if (successItems.length > 0) {
-        setImages((prev) => [...prev, ...successItems])
+        setImportCropQueue((prev) => [...prev, ...successItems])
       }
 
       if (failItems.length > 0) {
@@ -474,7 +534,7 @@ function ToolPage() {
     stopCamera()
   }
 
-  const capturePhoto = async () => {
+  const capturePhoto = () => {
     const video = videoRef.current
     if (!video || !video.videoWidth || !video.videoHeight) return
 
@@ -483,61 +543,19 @@ function ToolPage() {
     canvas.height = video.videoHeight
     const context = canvas.getContext('2d')
     context.drawImage(video, 0, 0)
-    setIsProcessingImages(true)
     setErrorMessage('')
 
-    try {
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.95)
-      const edge = scanPipelineInputLongEdge
-      const qHigh = JPEG_QUALITY_PRESETS.high
-      await yieldToUi()
-
-      let pipelineUrl = null
-      let pendingBitmap = null
-      try {
-        const { bitmap } = await withTimeout(
-          createScaledScanBitmap(dataUrl, edge, 'image/jpeg'),
-          IMPORT_DECODE_TIMEOUT_MS,
-          '照片處理逾時，請再試一次。',
-        )
-        pendingBitmap = bitmap
-        await yieldToUi()
-        pipelineUrl = await applyOpenCvDocumentScanFromBitmap(bitmap, qHigh)
-        pendingBitmap = null
-      } catch {
-        if (pendingBitmap) {
-          try {
-            pendingBitmap.close()
-          } catch {
-            /* ignore */
-          }
-          pendingBitmap = null
-        }
-      }
-
-      if (!pipelineUrl) {
-        const { dataUrl: ready } = await compressImageWithDimensions(
-          dataUrl,
-          edge,
-          SCAN_PIPELINE_PREJPEG_QUALITY,
-        )
-        await yieldToUi()
-        pipelineUrl = await runCanvasFallbackPipeline(ready)
-      }
-
-      await yieldToUi()
-      const storedUrl = await finalizeImageForList(pipelineUrl)
-      setImages((prev) => [
-        ...prev,
-        toImageItem(storedUrl, `capture-${prev.length + 1}`, pipelineUrl),
-      ])
-      if (cameraMode === 'single') {
-        closeCamera()
-      }
-    } catch (error) {
-      setErrorMessage(error.message || '拍照處理失敗，請再試一次。')
-    } finally {
-      setIsProcessingImages(false)
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.95)
+    setImportCropQueue((q) => [
+      ...q,
+      {
+        id: newImportQueueId(),
+        fileName: `capture-${q.length + 1}`,
+        dataUrl,
+      },
+    ])
+    if (cameraMode === 'single') {
+      closeCamera()
     }
   }
 
@@ -627,19 +645,92 @@ function ToolPage() {
     }
   }
 
+  const exportJpgDownloads = useCallback(async () => {
+    if (images.length === 0) return
+    setErrorMessage('')
+    setIsExporting(true)
+    try {
+      for (let i = 0; i < images.length; i += 1) {
+        const im = images[i]
+        const src = im.baseSrc ?? im.src
+        const res = await fetch(src)
+        const blob = await res.blob()
+        const rawName = im.name || `scan-${i + 1}`
+        const base = rawName.replace(/\.[^.]+$/, '') || `scan-${i + 1}`
+        const fileName = /\.(jpe?g|png|webp)$/i.test(rawName) ? rawName : `${base}.jpg`
+        const url = URL.createObjectURL(blob)
+        triggerDownload(url, fileName)
+        URL.revokeObjectURL(url)
+        await yieldToUi()
+        await new Promise((r) => setTimeout(r, 280))
+      }
+    } catch (e) {
+      setErrorMessage(e?.message || '匯出圖片失敗。')
+    } finally {
+      setIsExporting(false)
+    }
+  }, [images])
+
+  const shareImagesNative = useCallback(async () => {
+    if (images.length === 0) return
+    setErrorMessage('')
+    if (typeof navigator === 'undefined' || typeof navigator.share !== 'function') {
+      setErrorMessage('此瀏覽器不支援系統分享，請改用「下載 JPG」或輸出 PDF。')
+      return
+    }
+    setIsExporting(true)
+    try {
+      const files = []
+      for (let i = 0; i < images.length; i += 1) {
+        const im = images[i]
+        const res = await fetch(im.baseSrc ?? im.src)
+        const blob = await res.blob()
+        const rawName = (im.name || `scan-${i + 1}`).replace(/\.[^.]+$/, '') || `scan-${i + 1}`
+        const fileName = `${rawName}.jpg`
+        const type = blob.type && blob.type.startsWith('image/') ? blob.type : 'image/jpeg'
+        files.push(new File([blob], fileName, { type }))
+      }
+      const payload = files.length === 1 ? { files: [files[0]] } : { files }
+      if (typeof navigator.canShare === 'function' && !navigator.canShare(payload)) {
+        setErrorMessage(
+          '此環境無法一次分享這些圖片（部分裝置一次僅支援一張）。請用「下載 JPG」逐張存檔，或輸出 PDF。',
+        )
+        return
+      }
+      await navigator.share({ ...payload, title: '掃描圖片' })
+    } catch (e) {
+      if (e?.name === 'AbortError') return
+      setErrorMessage(e?.message || '分享失敗。')
+    } finally {
+      setIsExporting(false)
+    }
+  }, [images])
+
   return (
     <main className="app">
-      {cropTargetId != null && cropModalUrl ? (
+      {importHead ? (
+        <CropAdjustModal
+          key={`import-${importHead.id}`}
+          variant="import"
+          imageUrl={importHead.dataUrl}
+          onClose={() => handleImportSkip(importHead)}
+          onApply={(cropped) => handleImportCropApply(cropped, importHead)}
+        />
+      ) : cropTargetId != null && cropModalUrl ? (
         <CropAdjustModal
           key={cropTargetId}
+          variant="edit"
           imageUrl={cropModalUrl}
           onClose={() => setCropTargetId(null)}
           onApply={handleCropApplyFromModal}
         />
       ) : null}
       <header className="header">
-        <h1>照片轉 PDF</h1>
-        <p>上傳或拍照後，調整順序與輸出設定，一鍵匯出 PDF。</p>
+        <h1>文件掃描</h1>
+        <p>
+          上傳或拍照 → <strong>確認裁切範圍</strong> → 自動掃描 → 匯出 <strong>PDF</strong> 或{' '}
+          <strong>圖片</strong>（手機可用「分享」存到相簿）。
+        </p>
       </header>
 
       <section className="card controls">
@@ -752,8 +843,8 @@ function ToolPage() {
           <div className="progress-card">
             <div className="progress-text">
               <strong>
-                {uploadProgress.mode === 'batch' ? '批次匯入中' : '單張匯入中'} {uploadProgress.current}/
-                {uploadProgress.total}
+                {uploadProgress.mode === 'batch' ? '讀取檔案（批次）' : '讀取檔案（單張）'}{' '}
+                {uploadProgress.current}/{uploadProgress.total}
               </strong>
               <span>{uploadProgress.currentFileName}</span>
             </div>
@@ -832,22 +923,39 @@ function ToolPage() {
           </label>
         </div>
         <p className="import-pipeline-hint">
-          支援 PNG／JPEG／WebP／AVIF／GIF／BMP 等：優先<strong>檔頭讀尺寸</strong>或
-          <strong>ImageDecoder</strong> 直接縮圖再掃描，大檔也較快。掃描含<strong>自動透視、白邊裁切、紙張色階</strong>
-          （接近事務機掃描）；長邊約 {SCAN_PIPELINE_MIN_LONG_EDGE}～{SCAN_PIPELINE_CAP_LONG_EDGE}px。列表預覽依「圖片壓縮品質」，
-          <strong>PDF 以掃描原圖</strong>（長邊上限 {PDF_EXPORT_MAX_LONG_EDGE}px）嵌入。
+          <strong>流程：</strong>選圖或拍照後會先開<strong>裁切視窗</strong>，確認範圍並按「套用並掃描」才會做透視與掃描色階；略過則不加入列表。
+          支援常見圖檔與 HEIC；掃描長邊約 {SCAN_PIPELINE_MIN_LONG_EDGE}～{SCAN_PIPELINE_CAP_LONG_EDGE}px。列表預覽依「圖片壓縮品質」，
+          <strong>PDF／匯出圖片以掃描結果</strong>為主（PDF 嵌入長邊上限 {PDF_EXPORT_MAX_LONG_EDGE}px）。
         </p>
 
-        <div className="toolbar">
+        <div className="toolbar toolbar-export">
           <span>{imageCountLabel}</span>
-          <button
-            type="button"
-            className="button primary"
-            onClick={exportPdf}
-            disabled={images.length === 0 || isExporting || isProcessingImages}
-          >
-            {isExporting ? '輸出中...' : '輸出 PDF'}
-          </button>
+          <div className="button-group toolbar-export-buttons">
+            <button
+              type="button"
+              className="button primary"
+              onClick={exportPdf}
+              disabled={images.length === 0 || isExporting || isProcessingImages}
+            >
+              {isExporting ? '輸出中...' : '輸出 PDF'}
+            </button>
+            <button
+              type="button"
+              className="button secondary"
+              onClick={exportJpgDownloads}
+              disabled={images.length === 0 || isExporting || isProcessingImages}
+            >
+              {isExporting ? '輸出中...' : '下載 JPG（多張）'}
+            </button>
+            <button
+              type="button"
+              className="button secondary"
+              onClick={shareImagesNative}
+              disabled={images.length === 0 || isExporting || isProcessingImages}
+            >
+              分享圖片（存相簿）
+            </button>
+          </div>
         </div>
         {downloadNotice && (
           <div className="download-notice">
@@ -882,8 +990,10 @@ function ToolPage() {
                     type="button"
                     className="button secondary"
                     onClick={() => setCropTargetId(image.id)}
+                    disabled={importHead != null}
+                    title={importHead ? '請先完成目前匯入的裁切／掃描' : undefined}
                   >
-                    調整裁切
+                    重新裁切並掃描
                   </button>
                   <button type="button" className="button ghost" onClick={() => moveImage(index, -1)}>
                     上移
