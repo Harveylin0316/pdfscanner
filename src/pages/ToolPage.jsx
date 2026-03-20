@@ -34,7 +34,7 @@ const PDF_IMAGE_COMPRESSION = {
 
 /** 掃描管線長邊下限（可調低以換取速度；與 OpenCV Worker 解碼上限需一致） */
 const SCAN_PIPELINE_MIN_LONG_EDGE = 1600
-/** 送進 OpenCV Worker 的 bitmap 長邊硬上限（主執行緒 getImageData + WASM 與此成正比） */
+/** 送進 OpenCV Worker 的 bitmap 長邊硬上限（Worker 內 getImageData／WASM 與此成正比；主執行緒不讀像素） */
 const OPEN_CV_PIPELINE_BITMAP_MAX_LONG_EDGE = 2600
 /** 約 300dpi A4 長邊量級，與下方表單「圖片長邊上限」上限一致 */
 const SCAN_PIPELINE_CAP_LONG_EDGE = 4000
@@ -647,67 +647,6 @@ function ToolPage() {
     }
   }
 
-  const exportJpgDownloads = useCallback(async () => {
-    if (images.length === 0) return
-    setErrorMessage('')
-    setIsExporting(true)
-    try {
-      for (let i = 0; i < images.length; i += 1) {
-        const im = images[i]
-        const src = im.baseSrc ?? im.src
-        const res = await fetch(src)
-        const blob = await res.blob()
-        const rawName = im.name || `scan-${i + 1}`
-        const base = rawName.replace(/\.[^.]+$/, '') || `scan-${i + 1}`
-        const fileName = /\.(jpe?g|png|webp)$/i.test(rawName) ? rawName : `${base}.jpg`
-        const url = URL.createObjectURL(blob)
-        triggerDownload(url, fileName)
-        URL.revokeObjectURL(url)
-        await yieldToUi()
-        await new Promise((r) => setTimeout(r, 280))
-      }
-    } catch (e) {
-      setErrorMessage(e?.message || '匯出圖片失敗。')
-    } finally {
-      setIsExporting(false)
-    }
-  }, [images])
-
-  const shareImagesNative = useCallback(async () => {
-    if (images.length === 0) return
-    setErrorMessage('')
-    if (typeof navigator === 'undefined' || typeof navigator.share !== 'function') {
-      setErrorMessage('此瀏覽器不支援系統分享，請改用「下載 JPG」或輸出 PDF。')
-      return
-    }
-    setIsExporting(true)
-    try {
-      const files = []
-      for (let i = 0; i < images.length; i += 1) {
-        const im = images[i]
-        const res = await fetch(im.baseSrc ?? im.src)
-        const blob = await res.blob()
-        const rawName = (im.name || `scan-${i + 1}`).replace(/\.[^.]+$/, '') || `scan-${i + 1}`
-        const fileName = `${rawName}.jpg`
-        const type = blob.type && blob.type.startsWith('image/') ? blob.type : 'image/jpeg'
-        files.push(new File([blob], fileName, { type }))
-      }
-      const payload = files.length === 1 ? { files: [files[0]] } : { files }
-      if (typeof navigator.canShare === 'function' && !navigator.canShare(payload)) {
-        setErrorMessage(
-          '此環境無法一次分享這些圖片（部分裝置一次僅支援一張）。請用「下載 JPG」逐張存檔，或輸出 PDF。',
-        )
-        return
-      }
-      await navigator.share({ ...payload, title: '掃描圖片' })
-    } catch (e) {
-      if (e?.name === 'AbortError') return
-      setErrorMessage(e?.message || '分享失敗。')
-    } finally {
-      setIsExporting(false)
-    }
-  }, [images])
-
   return (
     <main className="app">
       {importHead ? (
@@ -730,8 +669,7 @@ function ToolPage() {
       <header className="header">
         <h1>文件掃描</h1>
         <p>
-          上傳或拍照 → <strong>確認裁切範圍</strong> → 自動掃描 → 匯出 <strong>PDF</strong> 或{' '}
-          <strong>圖片</strong>（手機可用「分享」存到相簿）。
+          上傳或拍照 → <strong>確認裁切範圍</strong> → 自動掃描 → 匯出 <strong>PDF</strong>。
         </p>
       </header>
 
@@ -928,37 +866,19 @@ function ToolPage() {
           <strong>流程：</strong>選圖或拍照後會先開<strong>裁切視窗</strong>，確認範圍並按「套用並掃描」才會做透視與掃描色階；略過則不加入列表。
           支援常見圖檔與 HEIC；OpenCV 處理用 bitmap 長邊至多約 {OPEN_CV_PIPELINE_BITMAP_MAX_LONG_EDGE}px（較快），表單「圖片長邊上限」仍影響列表壓縮。可調範圍約{' '}
           {SCAN_PIPELINE_MIN_LONG_EDGE}～{SCAN_PIPELINE_CAP_LONG_EDGE}px。列表預覽依「圖片壓縮品質」，
-          <strong>PDF／匯出圖片以掃描結果</strong>為主（PDF 嵌入長邊上限 {PDF_EXPORT_MAX_LONG_EDGE}px）。
+          <strong>PDF 以掃描結果</strong>嵌入（長邊上限 {PDF_EXPORT_MAX_LONG_EDGE}px）。
         </p>
 
-        <div className="toolbar toolbar-export">
+        <div className="toolbar">
           <span>{imageCountLabel}</span>
-          <div className="button-group toolbar-export-buttons">
-            <button
-              type="button"
-              className="button primary"
-              onClick={exportPdf}
-              disabled={images.length === 0 || isExporting || isProcessingImages}
-            >
-              {isExporting ? '輸出中...' : '輸出 PDF'}
-            </button>
-            <button
-              type="button"
-              className="button secondary"
-              onClick={exportJpgDownloads}
-              disabled={images.length === 0 || isExporting || isProcessingImages}
-            >
-              {isExporting ? '輸出中...' : '下載 JPG（多張）'}
-            </button>
-            <button
-              type="button"
-              className="button secondary"
-              onClick={shareImagesNative}
-              disabled={images.length === 0 || isExporting || isProcessingImages}
-            >
-              分享圖片（存相簿）
-            </button>
-          </div>
+          <button
+            type="button"
+            className="button primary"
+            onClick={exportPdf}
+            disabled={images.length === 0 || isExporting || isProcessingImages}
+          >
+            {isExporting ? '輸出中...' : '輸出 PDF'}
+          </button>
         </div>
         {downloadNotice && (
           <div className="download-notice">

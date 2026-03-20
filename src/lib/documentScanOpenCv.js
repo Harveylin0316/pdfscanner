@@ -3,6 +3,8 @@
  * Worker 不可用時回傳 null（改走簡易裁切 + 文件加強）。
  */
 
+import { WORKER_MSG } from './documentScanOpenCvProtocol.js'
+
 const WORKER_JOB_TIMEOUT_MS = 90_000
 
 let workerRef = null
@@ -62,11 +64,13 @@ function getWorker() {
   }
 }
 
+export { WORKER_MSG } from './documentScanOpenCvProtocol.js'
+
 /** 進入頁面後背景載入 Worker + OpenCV */
 export function warmUpOpenCv() {
   const w = getWorker()
   if (!w) return
-  w.postMessage({ type: 'warmup', id: -1 })
+  w.postMessage({ type: WORKER_MSG.warmup, id: -1 })
 }
 
 /**
@@ -104,6 +108,7 @@ export function applyOpenCvDocumentScan(
     pending.set(id, { resolve, timer })
     try {
       w.postMessage({
+        type: WORKER_MSG.scanDataUrl,
         id,
         dataUrl,
         jpegQuality,
@@ -124,8 +129,8 @@ export function applyOpenCvDocumentScan(
 }
 
 /**
- * 將已縮放之 ImageBitmap 交給 Worker（transfer），略過 data URL → fetch → 再 JPEG 解碼。
- * 失敗時會關閉 bitmap；成功時由 Worker 關閉。
+ * 將已縮放之 ImageBitmap 以 Transferable 交給 Worker；主執行緒不做 getImageData／matFromImageData。
+ * Worker 內以 OffscreenCanvas 繪製後再 getImageData → OpenCV。失敗時關閉 bitmap；成功由 Worker 關閉。
  * @param {ImageBitmap} bitmap
  * @param {number} [jpegQuality]
  * @returns {Promise<string|null>}
@@ -156,7 +161,7 @@ export function applyOpenCvDocumentScanFromBitmap(bitmap, jpegQuality = 0.92) {
 
     pending.set(id, { resolve, timer })
     try {
-      w.postMessage({ id, bitmap, jpegQuality }, [bitmap])
+      w.postMessage({ type: WORKER_MSG.scanBitmap, id, bitmap, jpegQuality }, [bitmap])
     } catch {
       clearTimeout(timer)
       pending.delete(id)

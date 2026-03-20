@@ -147,18 +147,6 @@ label.button input {
   gap: 10px;
 }
 
-.toolbar-export {
-  flex-wrap: wrap;
-}
-
-.toolbar-export-buttons {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  justify-content: flex-end;
-  max-width: 100%;
-}
-
 .settings-grid {
   margin-top: 14px;
   display: grid;

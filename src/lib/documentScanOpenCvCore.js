@@ -483,7 +483,49 @@ function polishRgbaMatLuminance(mat) {
   }
 }
 
-function scannerLookLab(cv, srcRgba) {
+/**
+ * 以取樣分位數估計 L 通道 lo/hi，再用 convertTo 線性拉伸（取代 CLAHE，成本低很多）。
+ */
+function stretchLChannelByPercentiles(cv, L, Lout) {
+  const rows = L.rows
+  const cols = L.cols
+  const n = rows * cols
+  try {
+    const data = L.data
+    if (!data || data.byteLength < n) {
+      L.copyTo(Lout)
+      return
+    }
+    const step = Math.max(1, Math.ceil(n / 100_000))
+    const samples = []
+    for (let i = 0; i < n; i += step) {
+      samples.push(data[i])
+    }
+    if (samples.length < 12) {
+      L.copyTo(Lout)
+      return
+    }
+    samples.sort((a, b) => a - b)
+    const lo = samples[Math.max(0, Math.floor(samples.length * 0.04))] ?? 0
+    const hi = samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.96))] ?? 255
+    const range = Math.max(8, hi - lo)
+    const alpha = 255.0 / range
+    const beta = -lo * alpha
+    L.convertTo(Lout, cv.CV_8U, alpha, beta)
+  } catch {
+    try {
+      L.copyTo(Lout)
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * 輕量「掃描感」：Lab 空間只自適應拉開 L（亮度）對比，不做 CLAHE／不做二值化 Adaptive Threshold，
+ * 以免色偏或變成傳真線稿。輸入長邊應已由呼叫端限制（見 ENHANCE_MAX_LONG_EDGE）。
+ */
+function scannerLookLightweightLab(cv, srcRgba) {
   const rgb = new cv.Mat()
   cv.cvtColor(srcRgba, rgb, cv.COLOR_RGBA2RGB, 0)
 
@@ -497,11 +539,8 @@ function scannerLookLab(cv, srcRgba) {
   const A = mv.get(1)
   const Bch = mv.get(2)
 
-  /** 較大 tile 減少分塊運算量，速度明顯優於 8×8，畫質仍接近掃描感 */
-  const clahe = cv.createCLAHE(3.35, new cv.Size(12, 12))
   const L2 = new cv.Mat()
-  clahe.apply(L, L2)
-  clahe.delete()
+  stretchLChannelByPercentiles(cv, L, L2)
 
   const mv2 = new cv.MatVector()
   mv2.push_back(L2)
@@ -539,6 +578,9 @@ const MAX_WARP_PIXELS = 14_000_000
  * 對 3～4K 輸入可省大量 WASM 時間，畫質多數文件仍足夠。
  */
 const WARP_WORK_MAX_LONG_EDGE = 2200
+
+/** 透視／裁白邊後、進入 Lab 色調前再縮小，降低 cvtColor/split/merge 與後續 JPEG 像素量 */
+const ENHANCE_MAX_LONG_EDGE = 2000
 
 /**
  * 透視校正後裁掉多餘白邊（背景與文件對比），讓輸出更接近掃描範圍。
@@ -659,7 +701,18 @@ export async function runDocumentScanPipelineFromRgbaMat(cv, src, jpegQuality = 
       docMat = trimmed
     }
 
-    const enhanced = scannerLookLab(cv, docMat)
+    const longDoc = Math.max(docMat.cols, docMat.rows)
+    if (longDoc > ENHANCE_MAX_LONG_EDGE) {
+      const sc = ENHANCE_MAX_LONG_EDGE / longDoc
+      const nc = Math.max(1, Math.round(docMat.cols * sc))
+      const nr = Math.max(1, Math.round(docMat.rows * sc))
+      const smaller = new cv.Mat()
+      cv.resize(docMat, smaller, new cv.Size(nc, nr), 0, 0, cv.INTER_AREA)
+      docMat.delete()
+      docMat = smaller
+    }
+
+    const enhanced = scannerLookLightweightLab(cv, docMat)
     docMat.delete()
     srcTri.delete()
     dstTri.delete()

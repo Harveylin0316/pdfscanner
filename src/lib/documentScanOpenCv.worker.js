@@ -1,10 +1,11 @@
 /**
- * OpenCV 掃描於 Web Worker 執行，避免 WASM 卡住主執行緒（整頁凍結）
+ * OpenCV 掃描於 Web Worker：像素讀取（getImageData）僅在此執行緒，不阻塞主頁面。
  */
 import {
   runDocumentScanPipeline,
   runDocumentScanPipelineFromRgbaMat,
 } from './documentScanOpenCvCore.js'
+import { WORKER_MSG } from './documentScanOpenCvProtocol.js'
 
 const OPENCV_INIT_TIMEOUT_MS = 90_000
 
@@ -64,6 +65,59 @@ async function getCv() {
   }
 }
 
+/**
+ * Transfer 進來的 ImageBitmap → OffscreenCanvas → getImageData → OpenCV Mat（CV_8UC4）。
+ * 結束後關閉 bitmap；失敗亦關閉。
+ * @param {*} cv OpenCV 實例
+ * @param {ImageBitmap} bitmap
+ */
+function imageBitmapToRgbaSrcMat(cv, bitmap) {
+  const w = bitmap.width
+  const h = bitmap.height
+  if (!w || !h) {
+    try {
+      bitmap.close()
+    } catch {
+      /* ignore */
+    }
+    return null
+  }
+
+  const oc = new OffscreenCanvas(w, h)
+  let ctx
+  try {
+    ctx = oc.getContext('2d', { willReadFrequently: true })
+  } catch {
+    ctx = oc.getContext('2d')
+  }
+  if (!ctx) {
+    try {
+      bitmap.close()
+    } catch {
+      /* ignore */
+    }
+    return null
+  }
+
+  try {
+    ctx.drawImage(bitmap, 0, 0)
+    const imageData = ctx.getImageData(0, 0, w, h)
+    try {
+      bitmap.close()
+    } catch {
+      /* ignore */
+    }
+    return cv.matFromImageData(imageData)
+  } catch {
+    try {
+      bitmap.close()
+    } catch {
+      /* ignore */
+    }
+    return null
+  }
+}
+
 /** 串行處理，避免同時兩個 OpenCV job 打爆 WASM */
 const inbox = []
 let drainRunning = false
@@ -74,10 +128,17 @@ async function drainInbox() {
   try {
     while (inbox.length > 0) {
       const event = inbox.shift()
-      const { id, type, dataUrl, jpegQuality, maxDecodeLongEdge, knownDecodeWH, bitmap } =
-        event.data || {}
+      const {
+        type,
+        id,
+        dataUrl,
+        jpegQuality,
+        maxDecodeLongEdge,
+        knownDecodeWH,
+        bitmap,
+      } = event.data || {}
 
-      if (type === 'warmup') {
+      if (type === WORKER_MSG.warmup) {
         try {
           await getCv()
           self.postMessage({ id, ok: true })
@@ -90,36 +151,33 @@ async function drainInbox() {
       try {
         const cv = await getCv()
         if (!cv) {
+          if (bitmap instanceof ImageBitmap) {
+            try {
+              bitmap.close()
+            } catch {
+              /* ignore */
+            }
+          }
           self.postMessage({ id, result: null })
           continue
         }
 
-        if (bitmap instanceof ImageBitmap) {
-          let bmp = bitmap
+        if (type === WORKER_MSG.scanBitmap && bitmap instanceof ImageBitmap) {
           try {
-            const w = bmp.width
-            const h = bmp.height
-            if (!w || !h) {
-              try {
-                bmp.close()
-              } catch {
-                /* ignore */
-              }
+            const src = imageBitmapToRgbaSrcMat(cv, bitmap)
+            if (!src) {
               self.postMessage({ id, result: null })
               continue
             }
-            const oc = new OffscreenCanvas(w, h)
-            const ctx = oc.getContext('2d')
-            ctx.drawImage(bmp, 0, 0)
-            bmp.close()
-            bmp = null
-            const imageData = ctx.getImageData(0, 0, w, h)
-            const src = cv.matFromImageData(imageData)
-            const result = await runDocumentScanPipelineFromRgbaMat(cv, src, jpegQuality ?? 0.92)
+            const result = await runDocumentScanPipelineFromRgbaMat(
+              cv,
+              src,
+              jpegQuality ?? 0.92,
+            )
             self.postMessage({ id, result })
           } catch (err) {
             try {
-              if (bmp) bmp.close()
+              if (bitmap instanceof ImageBitmap) bitmap.close()
             } catch {
               /* ignore */
             }
@@ -128,14 +186,59 @@ async function drainInbox() {
           continue
         }
 
-        const result = await runDocumentScanPipeline(
-          cv,
-          dataUrl,
-          jpegQuality ?? 0.92,
-          maxDecodeLongEdge,
-          knownDecodeWH,
-        )
-        self.postMessage({ id, result })
+        if (bitmap instanceof ImageBitmap) {
+          try {
+            bitmap.close()
+          } catch {
+            /* ignore */
+          }
+        }
+
+        if (type === WORKER_MSG.scanDataUrl && typeof dataUrl === 'string') {
+          const result = await runDocumentScanPipeline(
+            cv,
+            dataUrl,
+            jpegQuality ?? 0.92,
+            maxDecodeLongEdge,
+            knownDecodeWH,
+          )
+          self.postMessage({ id, result })
+          continue
+        }
+
+        /** 相容舊訊息：未帶 type 時依欄位推斷 */
+        if (bitmap instanceof ImageBitmap) {
+          try {
+            const src = imageBitmapToRgbaSrcMat(cv, bitmap)
+            if (!src) {
+              self.postMessage({ id, result: null })
+              continue
+            }
+            const result = await runDocumentScanPipelineFromRgbaMat(
+              cv,
+              src,
+              jpegQuality ?? 0.92,
+            )
+            self.postMessage({ id, result })
+          } catch (err) {
+            self.postMessage({ id, result: null, error: String(err?.message || err) })
+          }
+          continue
+        }
+
+        if (typeof dataUrl === 'string') {
+          const result = await runDocumentScanPipeline(
+            cv,
+            dataUrl,
+            jpegQuality ?? 0.92,
+            maxDecodeLongEdge,
+            knownDecodeWH,
+          )
+          self.postMessage({ id, result })
+          continue
+        }
+
+        self.postMessage({ id, result: null })
       } catch (err) {
         self.postMessage({ id, result: null, error: String(err?.message || err) })
       }
