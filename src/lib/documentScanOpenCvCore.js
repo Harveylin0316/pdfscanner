@@ -421,66 +421,9 @@ function detectDocumentQuad(cv, gray, dw, dh, ds) {
     return goodEnough
   }
 
-  for (const [lo, hi, dil] of [
-    [20, 60, 2],
-    [15, 45, 2],
-  ]) {
-    const qc = detectQuadCanny(cv, blurred, dw, dh, ds, lo, hi, dil)
-    if (qc) candidates.push(qc)
-  }
-
+  /** 省掉第二輪 Canny（兩次 findContours），多數難例已可由 candidates 選最佳 */
   blurred.delete()
   return pickBestQuad(candidates, imgAreaFull)
-}
-
-/** 超過此像素數跳過 luminance polish（全圖逐像素成本高；CLAHE 已拉對比） */
-const POLISH_MAX_PIXELS = 2_800_000
-
-/**
- * 亮度分位數拉開（與主程式 polish 同概念），在 Worker 內改像素，避免主執行緒大圖 decode/upscale 卡死。
- * 僅處理連續 CV_8UC4（scannerLookLab 輸出通常為連續）。
- */
-function polishRgbaMatLuminance(mat) {
-  try {
-    if (typeof mat.isContinuous === 'function' && !mat.isContinuous()) return
-  } catch {
-    return
-  }
-
-  const rows = mat.rows
-  const cols = mat.cols
-  if (rows < 4 || cols < 4) return
-
-  const n = rows * cols
-  if (n > POLISH_MAX_PIXELS) return
-
-  const bytes = mat.data
-  /** 取樣略減可省排序時間，對大圖影響極小 */
-  const sampleStep = Math.max(1, Math.ceil(n / 100_000))
-  const samples = []
-  for (let j = 0; j < n; j += sampleStep) {
-    const i = j * 4
-    samples.push(bytes[i] * 0.299 + bytes[i + 1] * 0.587 + bytes[i + 2] * 0.114)
-  }
-  if (samples.length < 20) return
-  samples.sort((a, b) => a - b)
-  const lo = samples[Math.max(0, Math.floor(samples.length * 0.035))] ?? 0
-  const hi = samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.992))] ?? 255
-  const range = Math.max(18, hi - lo)
-  const mul = 255 / range
-
-  for (let j = 0; j < n; j += 1) {
-    const i = j * 4
-    const r = bytes[i]
-    const g = bytes[i + 1]
-    const b = bytes[i + 2]
-    const lum = r * 0.299 + g * 0.587 + b * 0.114
-    const lum2 = Math.min(255, Math.max(0, (lum - lo) * mul))
-    const k = lum > 2 ? lum2 / lum : 1
-    bytes[i] = Math.min(255, Math.round(r * k))
-    bytes[i + 1] = Math.min(255, Math.round(g * k))
-    bytes[i + 2] = Math.min(255, Math.round(b * k))
-  }
 }
 
 /**
@@ -577,10 +520,10 @@ const MAX_WARP_PIXELS = 14_000_000
  * 透視／CLAHE 前將工作圖縮到此長邊以下（偵測仍用原圖推算的四角座標再換算）。
  * 對 3～4K 輸入可省大量 WASM 時間，畫質多數文件仍足夠。
  */
-const WARP_WORK_MAX_LONG_EDGE = 2200
+const WARP_WORK_MAX_LONG_EDGE = 2000
 
 /** 透視／裁白邊後、進入 Lab 色調前再縮小，降低 cvtColor/split/merge 與後續 JPEG 像素量 */
-const ENHANCE_MAX_LONG_EDGE = 2000
+const ENHANCE_MAX_LONG_EDGE = 1800
 
 /**
  * 透視校正後裁掉多餘白邊（背景與文件對比），讓輸出更接近掃描範圍。
@@ -642,7 +585,8 @@ export async function runDocumentScanPipelineFromRgbaMat(cv, src, jpegQuality = 
     const w = src.cols
     const h = src.rows
 
-    const detectMax = 600
+    /** 偵測用縮圖長邊（愈小愈快，過低易漏邊） */
+    const detectMax = 512
     const ds = Math.min(1, detectMax / Math.max(w, h))
     const dw = Math.max(1, Math.round(w * ds))
     const dh = Math.max(1, Math.round(h * ds))
@@ -718,7 +662,7 @@ export async function runDocumentScanPipelineFromRgbaMat(cv, src, jpegQuality = 
     dstTri.delete()
     M.delete()
 
-    polishRgbaMatLuminance(enhanced)
+    /** Lab L 拉伸已拉對比；略過全圖 RGB polish 以省一整趟像素迴圈 */
     const url = await matToJpegDataUrl(enhanced, jpegQuality)
     enhanced.delete()
     return url

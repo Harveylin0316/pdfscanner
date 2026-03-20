@@ -35,7 +35,7 @@ const PDF_IMAGE_COMPRESSION = {
 /** 掃描管線長邊下限（可調低以換取速度；與 OpenCV Worker 解碼上限需一致） */
 const SCAN_PIPELINE_MIN_LONG_EDGE = 1600
 /** 送進 OpenCV Worker 的 bitmap 長邊硬上限（Worker 內 getImageData／WASM 與此成正比；主執行緒不讀像素） */
-const OPEN_CV_PIPELINE_BITMAP_MAX_LONG_EDGE = 2600
+const OPEN_CV_PIPELINE_BITMAP_MAX_LONG_EDGE = 2000
 /** 約 300dpi A4 長邊量級，與下方表單「圖片長邊上限」上限一致 */
 const SCAN_PIPELINE_CAP_LONG_EDGE = 4000
 /** 僅備援路徑（無 ImageBitmap 時）送 JPEG；快路徑已用 bitmap 免此步 */
@@ -97,8 +97,8 @@ function ToolPage() {
   const [pdfMarginPreset, setPdfMarginPreset] = useState('normal')
   const [pdfOutputQuality, setPdfOutputQuality] = useState('high')
   const [pdfFileName, setPdfFileName] = useState('scanned-document')
-  /** 預設接近常見掃描／手機文件頁（長邊約 2400～2600px） */
-  const [maxImageEdge, setMaxImageEdge] = useState(2600)
+  /** 預設略降以縮短掃描時間；需要更清晰可手動拉高「圖片長邊上限」 */
+  const [maxImageEdge, setMaxImageEdge] = useState(2200)
   const [imageCompressionQuality, setImageCompressionQuality] = useState('high')
   const [cropTargetId, setCropTargetId] = useState(null)
   /** 上傳／拍照後先排隊，逐一開裁切 modal，套用後才跑掃描管線 */
@@ -309,7 +309,8 @@ function ToolPage() {
   const runScanPipelineOnCroppedDataUrl = useCallback(
     async (croppedDataUrl) => {
       const edge = Math.min(scanPipelineInputLongEdge, OPEN_CV_PIPELINE_BITMAP_MAX_LONG_EDGE)
-      const qHigh = JPEG_QUALITY_PRESETS.high
+      /** Worker 內 JPEG 編碼用「中」可明顯加速；PDF 匯出仍可用高品質重採樣 */
+      const qScanEncode = JPEG_QUALITY_PRESETS.medium
       let pipelineUrl = null
       let pendingBitmap = null
       try {
@@ -320,7 +321,7 @@ function ToolPage() {
         )
         pendingBitmap = bitmap
         await yieldToUi()
-        pipelineUrl = await applyOpenCvDocumentScanFromBitmap(bitmap, qHigh)
+        pipelineUrl = await applyOpenCvDocumentScanFromBitmap(bitmap, qScanEncode)
         pendingBitmap = null
       } catch {
         if (pendingBitmap) {
