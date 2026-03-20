@@ -5,7 +5,7 @@ import {
   runDocumentScanPipeline,
   runDocumentScanPipelineFromRgbaMat,
 } from './documentScanOpenCvCore.js'
-import { WORKER_MSG } from './documentScanOpenCvProtocol.js'
+import { SCAN_MODE, WORKER_MSG } from './documentScanOpenCvProtocol.js'
 
 const OPENCV_INIT_TIMEOUT_MS = 90_000
 
@@ -118,6 +118,12 @@ function imageBitmapToRgbaSrcMat(cv, bitmap) {
   }
 }
 
+function pipelineOptionsFromScanMode(scanMode) {
+  return {
+    scanMode: scanMode === SCAN_MODE.full ? SCAN_MODE.full : SCAN_MODE.instant,
+  }
+}
+
 /** 串行處理，避免同時兩個 OpenCV job 打爆 WASM */
 const inbox = []
 let drainRunning = false
@@ -136,7 +142,9 @@ async function drainInbox() {
         maxDecodeLongEdge,
         knownDecodeWH,
         bitmap,
+        scanMode: scanModeRaw,
       } = event.data || {}
+      const pipelineOpts = pipelineOptionsFromScanMode(scanModeRaw)
 
       if (type === WORKER_MSG.warmup) {
         try {
@@ -173,6 +181,7 @@ async function drainInbox() {
               cv,
               src,
               jpegQuality ?? 0.92,
+              pipelineOpts,
             )
             self.postMessage({ id, result })
           } catch (err) {
@@ -186,7 +195,8 @@ async function drainInbox() {
           continue
         }
 
-        if (bitmap instanceof ImageBitmap) {
+        /** 僅在走 dataUrl 管線時關閉誤傳的 bitmap，避免吃掉「舊版無 type」訊息 */
+        if (type === WORKER_MSG.scanDataUrl && bitmap instanceof ImageBitmap) {
           try {
             bitmap.close()
           } catch {
@@ -201,6 +211,7 @@ async function drainInbox() {
             jpegQuality ?? 0.92,
             maxDecodeLongEdge,
             knownDecodeWH,
+            pipelineOpts,
           )
           self.postMessage({ id, result })
           continue
@@ -218,6 +229,7 @@ async function drainInbox() {
               cv,
               src,
               jpegQuality ?? 0.92,
+              pipelineOpts,
             )
             self.postMessage({ id, result })
           } catch (err) {
@@ -233,6 +245,7 @@ async function drainInbox() {
             jpegQuality ?? 0.92,
             maxDecodeLongEdge,
             knownDecodeWH,
+            pipelineOpts,
           )
           self.postMessage({ id, result })
           continue

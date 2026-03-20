@@ -2,7 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { jsPDF } from 'jspdf'
 import { CropAdjustModal } from '../components/CropAdjustModal.jsx'
 import { convertHeicToJpegDataUrl } from '../lib/heicConvert.js'
-import { applyOpenCvDocumentScanFromBitmap, warmUpOpenCv } from '../lib/documentScanOpenCv.js'
+import {
+  applyOpenCvDocumentScanFromBitmap,
+  SCAN_MODE,
+  warmUpOpenCv,
+} from '../lib/documentScanOpenCv.js'
 import { createScaledScanBitmap } from '../lib/scanBitmapInput.js'
 import { autoCropByCornerBackground, enhanceDocumentScanAggressive } from '../lib/scanPreprocess.js'
 import '../App.css'
@@ -36,6 +40,8 @@ const PDF_IMAGE_COMPRESSION = {
 const SCAN_PIPELINE_MIN_LONG_EDGE = 1600
 /** 送進 OpenCV Worker 的 bitmap 長邊硬上限（Worker 內 getImageData／WASM 與此成正比；主執行緒不讀像素） */
 const OPEN_CV_PIPELINE_BITMAP_MAX_LONG_EDGE = 2000
+/** 極速模式送 Worker 的 bitmap 長邊（與 core INSTANT_MAX_LONG_EDGE 對齊思路） */
+const INSTANT_PIPELINE_BITMAP_MAX_LONG_EDGE = 1600
 /** 約 300dpi A4 長邊量級，與下方表單「圖片長邊上限」上限一致 */
 const SCAN_PIPELINE_CAP_LONG_EDGE = 4000
 /** 僅備援路徑（無 ImageBitmap 時）送 JPEG；快路徑已用 bitmap 免此步 */
@@ -100,6 +106,8 @@ function ToolPage() {
   /** 預設略降以縮短掃描時間；需要更清晰可手動拉高「圖片長邊上限」 */
   const [maxImageEdge, setMaxImageEdge] = useState(2200)
   const [imageCompressionQuality, setImageCompressionQuality] = useState('high')
+  /** 未勾選＝極速（略過透視偵測）；勾選＝完整 OpenCV 管線 */
+  const [fullOpenCvScan, setFullOpenCvScan] = useState(false)
   const [cropTargetId, setCropTargetId] = useState(null)
   /** 上傳／拍照後先排隊，逐一開裁切 modal，套用後才跑掃描管線 */
   const [importCropQueue, setImportCropQueue] = useState([])
@@ -308,9 +316,13 @@ function ToolPage() {
    */
   const runScanPipelineOnCroppedDataUrl = useCallback(
     async (croppedDataUrl) => {
-      const edge = Math.min(scanPipelineInputLongEdge, OPEN_CV_PIPELINE_BITMAP_MAX_LONG_EDGE)
+      const bitmapCap = fullOpenCvScan
+        ? OPEN_CV_PIPELINE_BITMAP_MAX_LONG_EDGE
+        : INSTANT_PIPELINE_BITMAP_MAX_LONG_EDGE
+      const edge = Math.min(scanPipelineInputLongEdge, bitmapCap)
       /** Worker 內 JPEG 編碼用「中」可明顯加速；PDF 匯出仍可用高品質重採樣 */
       const qScanEncode = JPEG_QUALITY_PRESETS.medium
+      const scanMode = fullOpenCvScan ? SCAN_MODE.full : SCAN_MODE.instant
       let pipelineUrl = null
       let pendingBitmap = null
       try {
@@ -321,7 +333,7 @@ function ToolPage() {
         )
         pendingBitmap = bitmap
         await yieldToUi()
-        pipelineUrl = await applyOpenCvDocumentScanFromBitmap(bitmap, qScanEncode)
+        pipelineUrl = await applyOpenCvDocumentScanFromBitmap(bitmap, qScanEncode, { scanMode })
         pendingBitmap = null
       } catch {
         if (pendingBitmap) {
@@ -352,6 +364,7 @@ function ToolPage() {
       compressImageWithDimensions,
       finalizeImageForList,
       runCanvasFallbackPipeline,
+      fullOpenCvScan,
       scanPipelineInputLongEdge,
     ],
   )
@@ -863,10 +876,24 @@ function ToolPage() {
             </select>
           </label>
         </div>
+
+        <div className="settings-flag">
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={fullOpenCvScan}
+              onChange={(e) => setFullOpenCvScan(e.target.checked)}
+            />
+            <span>
+              <strong>完整透視掃描</strong>（OpenCV 偵測紙張並拉平，較慢）。未勾選時為<strong>極速</strong>：只壓縮裁切區域、不做透視偵測，通常可快<strong>數倍～約十倍</strong>；桌面斜拍、邊緣不易裁準時再勾選。
+            </span>
+          </label>
+        </div>
+
         <p className="import-pipeline-hint">
-          <strong>流程：</strong>選圖或拍照後會先開<strong>裁切視窗</strong>，確認範圍並按「套用並掃描」才會做透視與掃描色階；略過則不加入列表。
-          支援常見圖檔與 HEIC；OpenCV 處理用 bitmap 長邊至多約 {OPEN_CV_PIPELINE_BITMAP_MAX_LONG_EDGE}px（較快），表單「圖片長邊上限」仍影響列表壓縮。可調範圍約{' '}
-          {SCAN_PIPELINE_MIN_LONG_EDGE}～{SCAN_PIPELINE_CAP_LONG_EDGE}px。列表預覽依「圖片壓縮品質」，
+          <strong>流程：</strong>選圖或拍照後會先開<strong>裁切視窗</strong>，確認範圍並按「套用並掃描」；略過則不加入列表。預設<strong>極速</strong>（bitmap 長邊至多約 {INSTANT_PIPELINE_BITMAP_MAX_LONG_EDGE}
+          px）；勾選完整掃描時至多約 {OPEN_CV_PIPELINE_BITMAP_MAX_LONG_EDGE}px 並跑透視／色階。
+          支援常見圖檔與 HEIC；表單「圖片長邊上限」仍影響列表壓縮（約 {SCAN_PIPELINE_MIN_LONG_EDGE}～{SCAN_PIPELINE_CAP_LONG_EDGE}px）。
           <strong>PDF 以掃描結果</strong>嵌入（長邊上限 {PDF_EXPORT_MAX_LONG_EDGE}px）。
         </p>
 

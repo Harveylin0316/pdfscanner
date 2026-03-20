@@ -6,3 +6,9 @@ export const WORKER_MSG = {
   scanBitmap: 'scanBitmap',
   scanDataUrl: 'scanDataUrl',
 }
+
+/** instant：裁切後只縮圖+JPEG（略過偵測／透視／Lab，可快很多）。full：完整 OpenCV 管線 */
+export const SCAN_MODE = {
+  instant: 'instant',
+  full: 'full',
+}

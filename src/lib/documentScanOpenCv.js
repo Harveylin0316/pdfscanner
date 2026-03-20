@@ -3,7 +3,7 @@
  * Worker 不可用時回傳 null（改走簡易裁切 + 文件加強）。
  */
 
-import { WORKER_MSG } from './documentScanOpenCvProtocol.js'
+import { SCAN_MODE, WORKER_MSG } from './documentScanOpenCvProtocol.js'
 
 const WORKER_JOB_TIMEOUT_MS = 90_000
 
@@ -64,7 +64,7 @@ function getWorker() {
   }
 }
 
-export { WORKER_MSG } from './documentScanOpenCvProtocol.js'
+export { SCAN_MODE, WORKER_MSG } from './documentScanOpenCvProtocol.js'
 
 /** 進入頁面後背景載入 Worker + OpenCV */
 export function warmUpOpenCv() {
@@ -80,11 +80,15 @@ export function warmUpOpenCv() {
  * @param {{ width: number, height: number } | null} [knownDecodeWH] 可加速 Worker 內解碼（略過全圖 probe）
  * @returns {Promise<string|null>}
  */
+/**
+ * @param {{ scanMode?: 'instant'|'full' }} [options] 預設 instant
+ */
 export function applyOpenCvDocumentScan(
   dataUrl,
   jpegQuality = 0.92,
   maxDecodeLongEdge,
   knownDecodeWH = null,
+  options = {},
 ) {
   const w = getWorker()
   if (!w) {
@@ -107,12 +111,14 @@ export function applyOpenCvDocumentScan(
 
     pending.set(id, { resolve, timer })
     try {
+      const scanMode = options.scanMode === SCAN_MODE.full ? SCAN_MODE.full : SCAN_MODE.instant
       w.postMessage({
         type: WORKER_MSG.scanDataUrl,
         id,
         dataUrl,
         jpegQuality,
         maxDecodeLongEdge: edge,
+        scanMode,
         knownDecodeWH:
           knownDecodeWH &&
           knownDecodeWH.width > 0 &&
@@ -133,9 +139,10 @@ export function applyOpenCvDocumentScan(
  * Worker 內以 OffscreenCanvas 繪製後再 getImageData → OpenCV。失敗時關閉 bitmap；成功由 Worker 關閉。
  * @param {ImageBitmap} bitmap
  * @param {number} [jpegQuality]
+ * @param {{ scanMode?: 'instant'|'full' }} [options] 預設 instant（極速，略過透視偵測）
  * @returns {Promise<string|null>}
  */
-export function applyOpenCvDocumentScanFromBitmap(bitmap, jpegQuality = 0.92) {
+export function applyOpenCvDocumentScanFromBitmap(bitmap, jpegQuality = 0.92, options = {}) {
   const w = getWorker()
   if (!bitmap) {
     return Promise.resolve(null)
@@ -161,7 +168,8 @@ export function applyOpenCvDocumentScanFromBitmap(bitmap, jpegQuality = 0.92) {
 
     pending.set(id, { resolve, timer })
     try {
-      w.postMessage({ type: WORKER_MSG.scanBitmap, id, bitmap, jpegQuality }, [bitmap])
+      const scanMode = options.scanMode === SCAN_MODE.full ? SCAN_MODE.full : SCAN_MODE.instant
+      w.postMessage({ type: WORKER_MSG.scanBitmap, id, bitmap, jpegQuality, scanMode }, [bitmap])
     } catch {
       clearTimeout(timer)
       pending.delete(id)

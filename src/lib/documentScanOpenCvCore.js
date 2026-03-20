@@ -525,6 +525,44 @@ const WARP_WORK_MAX_LONG_EDGE = 2000
 /** 透視／裁白邊後、進入 Lab 色調前再縮小，降低 cvtColor/split/merge 與後續 JPEG 像素量 */
 const ENHANCE_MAX_LONG_EDGE = 1800
 
+/** 極速模式：裁切後最長邊上限（只做 resize + JPEG，不做偵測／透視／Lab） */
+const INSTANT_MAX_LONG_EDGE = 1600
+
+/**
+ * 極速掃描：假設使用者裁切框已是文件區域，略過四邊偵測與透視，通常可比完整管線快一個數量級。
+ * @returns {Promise<string|null>}
+ */
+async function runInstantScanFromRgbaMat(cv, src, jpegQuality = 0.92) {
+  let mat = src
+  try {
+    const w = src.cols
+    const h = src.rows
+    const long = Math.max(w, h)
+    if (long > INSTANT_MAX_LONG_EDGE) {
+      const s = INSTANT_MAX_LONG_EDGE / long
+      const nw = Math.max(1, Math.round(w * s))
+      const nh = Math.max(1, Math.round(h * s))
+      const resized = new cv.Mat()
+      cv.resize(src, resized, new cv.Size(nw, nh), 0, 0, cv.INTER_AREA)
+      try {
+        src.delete()
+      } catch {
+        /* ignore */
+      }
+      mat = resized
+    }
+    return await matToJpegDataUrl(mat, jpegQuality)
+  } catch {
+    return null
+  } finally {
+    try {
+      mat.delete()
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 /**
  * 透視校正後裁掉多餘白邊（背景與文件對比），讓輸出更接近掃描範圍。
  * @returns {object | null} 新 cv.Mat；失敗回 null
@@ -574,9 +612,14 @@ function tryTrimWhiteMargins(cv, mat) {
 
 /**
  * 已由 RGBA 像素建立的 src Mat（CV_8UC4）；此函式會負責 delete(src)。
+ * @param {{ scanMode?: 'instant'|'full' }} [options] scanMode 非 full 時走極速路徑
  * @returns {Promise<string|null>}
  */
-export async function runDocumentScanPipelineFromRgbaMat(cv, src, jpegQuality = 0.92) {
+export async function runDocumentScanPipelineFromRgbaMat(cv, src, jpegQuality = 0.92, options = {}) {
+  if (options.scanMode !== 'full') {
+    return runInstantScanFromRgbaMat(cv, src, jpegQuality)
+  }
+
   const small = new cv.Mat()
   const gray = new cv.Mat()
   let workMat = src
@@ -686,6 +729,7 @@ export async function runDocumentScanPipeline(
   jpegQuality = 0.92,
   maxDecodeLongEdge = 2000,
   knownDecodeWH = null,
+  options = {},
 ) {
   let src = null
   try {
@@ -693,5 +737,5 @@ export async function runDocumentScanPipeline(
   } catch {
     return null
   }
-  return runDocumentScanPipelineFromRgbaMat(cv, src, jpegQuality)
+  return runDocumentScanPipelineFromRgbaMat(cv, src, jpegQuality, options)
 }
